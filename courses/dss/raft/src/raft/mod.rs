@@ -1,7 +1,13 @@
+use rand::Rng;
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::Arc;
 
 use futures::channel::mpsc::UnboundedSender;
+use futures::executor::ThreadPool;
+use futures::lock::Mutex;
+
+use futures_timer::Delay;
+use std::time::Duration;
 
 #[cfg(test)]
 pub mod config;
@@ -50,6 +56,7 @@ pub struct Raft {
     // Your data here (2A, 2B, 2C).
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
+    apply_ch: UnboundedSender<ApplyMsg>,
 }
 
 impl Raft {
@@ -75,12 +82,13 @@ impl Raft {
             persister,
             me,
             state: Arc::default(),
+            apply_ch,
         };
 
         // initialize from state persisted before a crash
         rf.restore(&raft_state);
 
-        crate::your_code_here((rf, apply_ch))
+        rf
     }
 
     /// save Raft's persistent state to stable storage,
@@ -200,14 +208,25 @@ impl Raft {
 // ```
 #[derive(Clone)]
 pub struct Node {
-    // Your code here.
+    raft: Arc<Mutex<Raft>>,
+    worker: ThreadPool,
 }
 
 impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
-        // Your code here.
-        crate::your_code_here(raft)
+        let node = Node {
+            raft: Arc::new(Mutex::new(raft)),
+            worker: ThreadPool::new().unwrap(),
+        };
+        let raft_clone = node.raft.clone();
+        node.worker.spawn_ok(async move {
+            let raft = raft_clone;
+            let timeout = rand::thread_rng().gen_range(100, 300);
+            Delay::new(Duration::from_millis(timeout)).await;
+            println!("election timeout");
+        });
+        node
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start
@@ -222,38 +241,34 @@ impl Node {
     /// at if it's ever committed. the second is the current term.
     ///
     /// This method must return without blocking on the raft.
-    pub fn start<M>(&self, command: &M) -> Result<(u64, u64)>
+    pub async fn start<M>(&self, command: &M) -> Result<(u64, u64)>
     where
         M: labcodec::Message,
     {
-        // Your code here.
-        // Example:
-        // self.raft.start(command)
-        crate::your_code_here(command)
+        let mut raft = self.raft.lock().await;
+        if raft.state.is_leader {
+            unimplemented!()
+        } else {
+            // TODO: What to do when election is in progress?
+            Err(Error::NotLeader)
+        }
     }
 
     /// The current term of this peer.
-    pub fn term(&self) -> u64 {
-        // Your code here.
-        // Example:
-        // self.raft.term
-        crate::your_code_here(())
+    pub async fn term(&self) -> u64 {
+        let mut raft = self.raft.lock().await;
+        raft.state.term
     }
 
     /// Whether this peer believes it is the leader.
-    pub fn is_leader(&self) -> bool {
-        // Your code here.
-        // Example:
-        // self.raft.leader_id == self.id
-        crate::your_code_here(())
+    pub async fn is_leader(&self) -> bool {
+        let mut raft = self.raft.lock().await;
+        raft.state.is_leader
     }
 
     /// The current state of this peer.
-    pub fn get_state(&self) -> State {
-        State {
-            term: self.term(),
-            is_leader: self.is_leader(),
-        }
+    pub async fn get_state(&self) -> State {
+        (*self.raft.lock().await.state).clone()
     }
 
     /// the tester calls kill() when a Raft instance won't be
