@@ -19,9 +19,12 @@ pub mod persister;
 #[cfg(test)]
 mod tests;
 
+mod wait_group;
+
 use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
+use wait_group::WaitGroup;
 
 pub struct ApplyMsg {
     pub command_valid: bool,
@@ -56,6 +59,7 @@ pub struct Raft {
     // this peer's index into peers[]
     me: usize,
     state: Arc<State>,
+    vote: Option<usize>,
     // Your data here (2A, 2B, 2C).
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
@@ -105,6 +109,7 @@ impl Raft {
             persister,
             me,
             state: Arc::default(),
+            vote: None,
             apply_ch,
             election_timer: None,
         };
@@ -161,6 +166,12 @@ impl Raft {
         } else {
             Err(Error::NotLeader)
         }
+    }
+
+    fn modify_state(&mut self, f: impl Fn(&mut State) -> ()) {
+      let mut state = (*self.state).clone();
+      f(&mut state);
+      self.state = Arc::new(state);
     }
 }
 
@@ -223,22 +234,46 @@ impl Node {
                 Delay::new(Duration::from_millis(timeout)).map(move |_| {
                     println!("node {}: election timeout ({})", me, timeout);
                     pool2.spawn_ok(async move {
-                        println!("node {}: starting election", me);
                         let mut raft = raft2.lock().await;
+                        raft.modify_state(|state| {
+                            state.is_leader = true;
+                            state.term += 1;
+                        });
                         let term = raft.state.term;
-                        for (index, peer) in raft.peers.iter().enumerate() {
+                        let peers = raft.peers.clone();
+                        let votes_needed = peers.len() / 2;
+                        println!(
+                            "node {}: starting election, waiting for {} votes",
+                            me, votes_needed
+                        );
+                        drop(raft);
+
+                        let wg = Arc::new(WaitGroup::new(votes_needed));
+                        for (index, peer) in peers.iter().enumerate() {
                             if index != me {
                                 let peer_clone = peer.clone();
+                                let wg = wg.clone();
                                 peer.spawn(async move {
-                                    peer_clone
-                                        .request_vote(&crate::proto::raftpb::RequestVoteArgs {
+                                    match peer_clone
+                                        .request_vote(&RequestVoteArgs {
                                             candidate_id: me as u64,
                                             term,
                                         })
-                                        .await;
+                                        .await
+                                    {
+                                        Ok(RequestVoteReply { vote_granted: true, .. }) => {
+                                            wg.done();
+                                        }
+                                        _ => {}
+                                    }
                                 });
                             }
                         }
+                        wg.wait().await;
+                        println!("node {}: got votes, becoming a leader", me);
+
+                        let mut raft = raft2.lock().await;
+                        raft.modify_state(|state| { state.is_leader = true; });
                     });
                 })
             }));
@@ -308,9 +343,37 @@ impl RaftService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
         println!("node {} got {:?}", self.me, args);
-        Ok(RequestVoteReply {
-            term: args.term,
-            vote_granted: true,
-        })
+        let mut raft = self.raft.lock().await;
+        let candidate = args.candidate_id as usize;
+        let response = if args.term < raft.state.term {
+            Ok(RequestVoteReply {
+                term: raft.state.term,
+                vote_granted: false,
+            })
+        } else if args.term == raft.state.term {
+            let vote_granted = match raft.vote {
+                Some(other) if other != candidate => false,
+                _ => {
+                    raft.vote = Some(candidate);
+                    true
+                }
+            };
+            Ok(RequestVoteReply {
+                term: args.term,
+                vote_granted,
+            })
+        } else {
+            raft.modify_state(|state| {
+                state.is_leader = false;
+                state.term = args.term;
+            });
+            raft.vote = Some(candidate);
+            Ok(RequestVoteReply {
+                term: args.term,
+                vote_granted: true,
+            })
+        };
+        println!("node {} responds with {:?}", self.me, response);
+        response
     }
 }
