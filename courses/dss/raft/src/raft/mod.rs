@@ -68,7 +68,7 @@ pub struct Raft {
 }
 
 struct CancellableTask {
-    sender: futures::channel::oneshot::Sender<()>,
+    _sender: futures::channel::oneshot::Sender<()>,
 }
 
 impl CancellableTask {
@@ -82,7 +82,7 @@ impl CancellableTask {
                 futures::future::select(receiver, task).await;
             })
             .unwrap();
-        CancellableTask { sender }
+        CancellableTask { _sender: sender }
     }
 }
 
