@@ -5,6 +5,9 @@ use std::sync::Arc;
 use futures::channel::mpsc::UnboundedSender;
 use futures::executor::ThreadPool;
 use futures::lock::Mutex;
+use futures::Future;
+use futures::future::FutureExt;
+use futures::task::SpawnExt;
 
 use futures_timer::Delay;
 use std::time::Duration;
@@ -57,6 +60,21 @@ pub struct Raft {
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
     apply_ch: UnboundedSender<ApplyMsg>,
+    election_timer: Option<CancellableTask>,
+}
+
+struct CancellableTask {
+    sender: futures::channel::oneshot::Sender<()>,
+}
+
+impl CancellableTask {
+    fn spawn<F: Future + std::marker::Unpin + std::marker::Send + 'static>(executor: impl futures::task::Spawn, task: F) -> Self {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        executor.spawn(async move {
+            futures::future::select(receiver, task).await;
+        }).unwrap();
+        CancellableTask { sender }
+    }
 }
 
 impl Raft {
@@ -83,6 +101,7 @@ impl Raft {
             me,
             state: Arc::default(),
             apply_ch,
+            election_timer: None,
         };
 
         // initialize from state persisted before a crash
@@ -121,44 +140,6 @@ impl Raft {
         // }
     }
 
-    /// example code to send a RequestVote RPC to a server.
-    /// server is the index of the target server in peers.
-    /// expects RPC arguments in args.
-    ///
-    /// The labrpc package simulates a lossy network, in which servers
-    /// may be unreachable, and in which requests and replies may be lost.
-    /// This method sends a request and waits for a reply. If a reply arrives
-    /// within a timeout interval, This method returns Ok(_); otherwise
-    /// this method returns Err(_). Thus this method may not return for a while.
-    /// An Err(_) return can be caused by a dead server, a live server that
-    /// can't be reached, a lost request, or a lost reply.
-    ///
-    /// This method is guaranteed to return (perhaps after a delay) *except* if
-    /// the handler function on the server side does not return.  Thus there
-    /// is no need to implement your own timeouts around this method.
-    ///
-    /// look at the comments in ../labrpc/src/lib.rs for more details.
-    fn send_request_vote(
-        &self,
-        server: usize,
-        args: RequestVoteArgs,
-    ) -> Receiver<Result<RequestVoteReply>> {
-        // Your code here if you want the rpc becomes async.
-        // Example:
-        // ```
-        // let peer = &self.peers[server];
-        // let peer_clone = peer.clone();
-        // let (tx, rx) = channel();
-        // peer.spawn(async move {
-        //     let res = peer_clone.request_vote(&args).await.map_err(Error::Rpc);
-        //     tx.send(res);
-        // });
-        // rx
-        // ```
-        let (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
-        crate::your_code_here((server, args, tx, rx))
-    }
-
     fn start<M>(&self, command: &M) -> Result<(u64, u64)>
     where
         M: labcodec::Message,
@@ -183,7 +164,6 @@ impl Raft {
     #[doc(hidden)]
     pub fn __suppress_deadcode(&mut self) {
         let _ = self.start(&0);
-        let _ = self.send_request_vote(0, Default::default());
         self.persist();
         let _ = &self.state;
         let _ = &self.me;
@@ -208,25 +188,51 @@ impl Raft {
 // ```
 #[derive(Clone)]
 pub struct Node {
+    me: usize,
     raft: Arc<Mutex<Raft>>,
-    worker: ThreadPool,
+    pool: Arc<ThreadPool>,
 }
 
 impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
-        let node = Node {
+        let mut node = Node {
+            me: raft.me,
             raft: Arc::new(Mutex::new(raft)),
-            worker: ThreadPool::new().unwrap(),
+            pool: Arc::new(ThreadPool::new().unwrap()),
         };
-        let raft_clone = node.raft.clone();
-        node.worker.spawn_ok(async move {
-            let raft = raft_clone;
-            let timeout = rand::thread_rng().gen_range(100, 300);
-            Delay::new(Duration::from_millis(timeout)).await;
-            println!("election timeout");
-        });
+        node.start_election_timer();
         node
+    }
+
+    fn start_election_timer(&mut self) {
+        let me = self.me;
+        let raft = self.raft.clone();
+        let raft2 = self.raft.clone();
+        let pool = self.pool.clone();
+        let pool2 = self.pool.clone();
+        self.pool.spawn_ok(async move {
+            let mut raft = raft.lock().await;
+            raft.election_timer = Some(CancellableTask::spawn(&pool, {
+                let timeout = rand::thread_rng().gen_range(100, 300);
+                Delay::new(Duration::from_millis(timeout)).map(move |_| {
+                    println!("node {}: election timeout ({})", me, timeout);
+                    pool2.spawn_ok(async move {
+                        println!("node {}: starting election", me);
+                        let mut raft = raft2.lock().await;
+                        let term = raft.state.term;
+                        for (index, peer) in raft.peers.iter().enumerate() {
+                            if index != me {
+                                let peer_clone = peer.clone();
+                                peer.spawn(async move {
+                                    peer_clone.request_vote(&crate::proto::raftpb::RequestVoteArgs{ candidate_id: me as u64, term }).await;
+                                });
+                            }
+                        };
+                    });
+                })
+            }));
+        });
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start
@@ -241,34 +247,35 @@ impl Node {
     /// at if it's ever committed. the second is the current term.
     ///
     /// This method must return without blocking on the raft.
-    pub async fn start<M>(&self, command: &M) -> Result<(u64, u64)>
+    pub fn start<M>(&self, _command: &M) -> Result<(u64, u64)>
     where
         M: labcodec::Message,
     {
-        let mut raft = self.raft.lock().await;
-        if raft.state.is_leader {
-            unimplemented!()
-        } else {
-            // TODO: What to do when election is in progress?
-            Err(Error::NotLeader)
-        }
+        futures::executor::block_on(async move {
+            let raft = self.raft.lock().await;
+            let _ = raft.apply_ch;
+            if raft.state.is_leader {
+                unimplemented!()
+            } else {
+                // TODO: What to do when election is in progress?
+                Err(Error::NotLeader)
+            }
+        })
     }
 
     /// The current term of this peer.
-    pub async fn term(&self) -> u64 {
-        let mut raft = self.raft.lock().await;
-        raft.state.term
+    pub fn term(&self) -> u64 {
+        self.get_state().term
     }
 
     /// Whether this peer believes it is the leader.
-    pub async fn is_leader(&self) -> bool {
-        let mut raft = self.raft.lock().await;
-        raft.state.is_leader
+    pub fn is_leader(&self) -> bool {
+        self.get_state().is_leader
     }
 
     /// The current state of this peer.
-    pub async fn get_state(&self) -> State {
-        (*self.raft.lock().await.state).clone()
+    pub fn get_state(&self) -> State {
+        futures::executor::block_on(async move { (*self.raft.lock().await.state).clone() })
     }
 
     /// the tester calls kill() when a Raft instance won't be
@@ -290,7 +297,7 @@ impl RaftService for Node {
     //
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
-        // Your code here (2A, 2B).
-        crate::your_code_here(args)
+        println!("node {} got {:?}", self.me, args);        
+        Ok(RequestVoteReply { term: args.term, vote_granted: true })
     }
 }
