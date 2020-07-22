@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use futures::channel::mpsc::UnboundedSender;
 use futures::executor::ThreadPool;
-use futures::lock::Mutex;
-use futures::Future;
 use futures::future::FutureExt;
+use futures::lock::Mutex;
 use futures::task::SpawnExt;
+use futures::Future;
 
 use futures_timer::Delay;
 use std::time::Duration;
@@ -68,11 +68,16 @@ struct CancellableTask {
 }
 
 impl CancellableTask {
-    fn spawn<F: Future + std::marker::Unpin + std::marker::Send + 'static>(executor: impl futures::task::Spawn, task: F) -> Self {
+    fn spawn<F: Future + std::marker::Unpin + std::marker::Send + 'static>(
+        executor: impl futures::task::Spawn,
+        task: F,
+    ) -> Self {
         let (sender, receiver) = futures::channel::oneshot::channel();
-        executor.spawn(async move {
-            futures::future::select(receiver, task).await;
-        }).unwrap();
+        executor
+            .spawn(async move {
+                futures::future::select(receiver, task).await;
+            })
+            .unwrap();
         CancellableTask { sender }
     }
 }
@@ -225,10 +230,15 @@ impl Node {
                             if index != me {
                                 let peer_clone = peer.clone();
                                 peer.spawn(async move {
-                                    peer_clone.request_vote(&crate::proto::raftpb::RequestVoteArgs{ candidate_id: me as u64, term }).await;
+                                    peer_clone
+                                        .request_vote(&crate::proto::raftpb::RequestVoteArgs {
+                                            candidate_id: me as u64,
+                                            term,
+                                        })
+                                        .await;
                                 });
                             }
-                        };
+                        }
                     });
                 })
             }));
@@ -297,7 +307,10 @@ impl RaftService for Node {
     //
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
-        println!("node {} got {:?}", self.me, args);        
-        Ok(RequestVoteReply { term: args.term, vote_granted: true })
+        println!("node {} got {:?}", self.me, args);
+        Ok(RequestVoteReply {
+            term: args.term,
+            vote_granted: true,
+        })
     }
 }
