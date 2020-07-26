@@ -1,12 +1,11 @@
 use rand::Rng;
-use std::sync::mpsc::{sync_channel, Receiver};
+
 use std::sync::Arc;
 
 use futures::channel::mpsc::UnboundedSender;
 use futures::executor::ThreadPool;
-use futures::future::FutureExt;
-use futures::lock::Mutex;
-use futures::task::SpawnExt;
+
+use futures::lock::{Mutex, MutexGuard};
 use futures::Future;
 
 use futures_timer::Delay;
@@ -65,6 +64,7 @@ pub struct Raft {
     // state a Raft server must maintain.
     apply_ch: UnboundedSender<ApplyMsg>,
     election_timer: Option<CancellableTask>,
+    heartbeat_task: Option<CancellableTask>,
 }
 
 struct CancellableTask {
@@ -73,8 +73,8 @@ struct CancellableTask {
 
 struct Select<A, B>(A, B);
 
-use std::task::{Context, Poll};
 use std::pin::Pin;
+use std::task::{Context, Poll};
 
 impl<A: Future, B: Future> Future for Select<A, B> {
     type Output = ();
@@ -84,21 +84,16 @@ impl<A: Future, B: Future> Future for Select<A, B> {
         let unsafe_self = unsafe { Pin::into_inner_unchecked(self) };
         match unsafe { Pin::new_unchecked(&mut unsafe_self.0) }.poll(cx) {
             Ready(_) => Ready(()),
-            Pending => {
-                match unsafe { Pin::new_unchecked(&mut unsafe_self.1) }.poll(cx) {
-                    Ready(_) => Ready(()),
-                    Pending => Pending,
-                }
-            }
+            Pending => match unsafe { Pin::new_unchecked(&mut unsafe_self.1) }.poll(cx) {
+                Ready(_) => Ready(()),
+                Pending => Pending,
+            },
         }
     }
 }
 
 impl CancellableTask {
-    fn spawn<F: Future + Send + 'static>(
-        executor: &ThreadPool,
-        task: F,
-    ) -> Self {
+    fn spawn<F: Future + Send + 'static>(executor: &ThreadPool, task: F) -> Self {
         let (sender, receiver) = futures::channel::oneshot::channel();
         executor.spawn_ok(Select(receiver, task));
         CancellableTask { _sender: sender }
@@ -131,6 +126,7 @@ impl Raft {
             vote: None,
             apply_ch,
             election_timer: None,
+            heartbeat_task: None,
         };
 
         // initialize from state persisted before a crash
@@ -188,9 +184,9 @@ impl Raft {
     }
 
     fn modify_state(&mut self, f: impl Fn(&mut State) -> ()) {
-      let mut state = (*self.state).clone();
-      f(&mut state);
-      self.state = Arc::new(state);
+        let mut state = (*self.state).clone();
+        f(&mut state);
+        self.state = Arc::new(state);
     }
 }
 
@@ -231,70 +227,105 @@ pub struct Node {
 impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
-        let mut node = Node {
+        let node = Node {
             me: raft.me,
             raft: Arc::new(Mutex::new(raft)),
             pool: Arc::new(ThreadPool::new().unwrap()),
         };
-        node.start_election_timer();
+        let node_ = node.clone();
+        node.pool.spawn_ok(async move {
+            node_.start_election_timer(node_.clone().raft.lock().await);
+        });
         node
     }
 
-    fn start_election_timer(&mut self) {
+    fn start_election_timer(&self, mut raft: MutexGuard<Raft>) {
         let self_ = self.clone();
-        self.pool.spawn_ok(async move {
-            let me = self_.me;
-            let self_1 = self_.clone();
-            let mut raft = self_1.raft.lock().await;
-            raft.election_timer = Some(CancellableTask::spawn(&self_1.pool, async move {
-                let self_1 = self_.clone();
-                let timeout = rand::thread_rng().gen_range(100, 300);
-                Delay::new(Duration::from_millis(timeout)).await;
-                println!("node {}: election timeout ({})", me, timeout);
-                self_1.pool.spawn_ok(async move {
-                    let mut raft = self_.raft.lock().await;
-                    raft.modify_state(|state| {
-                        state.is_leader = false;
-                        state.term += 1;
-                    });
-                    let term = raft.state.term;
-                    let peers = raft.peers.clone();
-                    let votes_needed = peers.len() / 2;
-                    println!(
-                        "node {}: starting election, waiting for {} votes",
-                        me, votes_needed
-                    );
-                    drop(raft);
-
-                    let wg = Arc::new(WaitGroup::new(votes_needed));
-                    for (index, peer) in peers.iter().enumerate() {
-                        if index != me {
-                            let peer_clone = peer.clone();
-                            let wg = wg.clone();
-                            peer.spawn(async move {
-                                match peer_clone
-                                    .request_vote(&RequestVoteArgs {
-                                        candidate_id: me as u64,
-                                        term,
-                                    })
-                                    .await
-                                {
-                                    Ok(RequestVoteReply { vote_granted: true, .. }) => {
-                                        wg.done();
-                                    }
-                                    _ => {}
-                                }
-                            });
-                        }
-                    }
-                    wg.wait().await;
-                    println!("node {}: got votes, becoming a leader", me);
-
-                    let mut raft = self_.raft.lock().await;
-                    raft.modify_state(|state| { state.is_leader = true; });
+        let me = self_.me;
+        raft.election_timer = Some(CancellableTask::spawn(&self.pool, async move {
+            let timeout = rand::thread_rng().gen_range(100, 300);
+            Delay::new(Duration::from_millis(timeout)).await;
+            println!("node {}: election timeout ({})", me, timeout);
+            {
+                let mut raft = self_.raft.lock().await;
+                raft.modify_state(|state| {
+                    state.is_leader = false;
+                    state.term += 1;
                 });
-            }));
+                let term = raft.state.term;
+                let peers = raft.peers.clone();
+                let votes_needed = peers.len() / 2;
+                println!(
+                    "node {}: starting election, waiting for {} votes",
+                    me, votes_needed
+                );
+                drop(raft);
+
+                let wg = Arc::new(WaitGroup::new(votes_needed));
+                for (index, peer) in peers.iter().enumerate() {
+                    if index != me {
+                        let peer_clone = peer.clone();
+                        let wg = wg.clone();
+                        peer.spawn(async move {
+                            match peer_clone
+                                .request_vote(&RequestVoteArgs {
+                                    candidate_id: me as u64,
+                                    term,
+                                })
+                                .await
+                            {
+                                Ok(RequestVoteReply {
+                                    vote_granted: true, ..
+                                }) => {
+                                    wg.done();
+                                }
+                                _ => {}
+                            }
+                        });
+                    }
+                }
+                wg.wait().await;
+                println!("node {}: got votes, becoming a leader", me);
+
+                self_.run_leader(term).await;
+            }
+        }));
+    }
+
+    async fn run_leader(&self, term: u64) {
+        let me = self.me;
+        let mut raft = self.raft.lock().await;
+        if raft.state.term != term {
+            warn!(
+                "node {}: run_leader: term {} has passed, current is {}",
+                self.me, term, raft.state.term
+            );
+            return;
+        }
+        raft.modify_state(|state| {
+            state.is_leader = true;
         });
+
+        let _self_ = self.clone();
+
+        let peers = raft.peers.clone();
+        raft.heartbeat_task = Some(CancellableTask::spawn(&self.pool, async move {
+            loop {
+                println!("node {}: sending heartbeats", me);
+                for (index, peer) in peers.iter().enumerate() {
+                    if index != me {
+                        let peer_clone = peer.clone();
+                        peer.spawn(async move {
+                            match peer_clone.append_entries(&AppendEntriesArgs { term }).await {
+                                Ok(AppendEntriesReply { .. }) => {}
+                                _ => {}
+                            }
+                        });
+                    }
+                }
+                Delay::new(Duration::from_millis(100)).await;
+            }
+        }));
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start
@@ -389,6 +420,28 @@ impl RaftService for Node {
                 term: args.term,
                 vote_granted: true,
             })
+        };
+        println!("node {} responds with {:?}", self.me, response);
+        response
+    }
+
+    async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
+        println!("node {} got {:?}", self.me, args);
+        let mut raft = self.raft.lock().await;
+        let response = if args.term < raft.state.term {
+            Ok(AppendEntriesReply {
+                term: raft.state.term,
+            })
+        } else if args.term == raft.state.term {
+            raft.election_timer = None;
+            Ok(AppendEntriesReply { term: args.term })
+        } else {
+            raft.election_timer = None;
+            raft.modify_state(|state| {
+                state.is_leader = false;
+                state.term = args.term;
+            });
+            Ok(AppendEntriesReply { term: args.term })
         };
         println!("node {} responds with {:?}", self.me, response);
         response

@@ -11,3 +11,11 @@ message RequestVoteReply {
     uint64 term = 1;
     bool voteGranted = 2;
 }
+
+message AppendEntriesArgs {
+    uint64 term = 1;
+}
+
+message AppendEntriesReply {
+    uint64 term = 1;
+}
