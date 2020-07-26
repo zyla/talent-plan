@@ -59,27 +59,37 @@ fn test_reelection_2a() {
     cfg.begin("Test (2A): election after network failure");
 
     let leader1 = cfg.check_one_leader();
+
     // if the leader disconnects, a new one should be elected.
+    debug!("Test action: disconnecting leader {}", leader1);
     cfg.disconnect(leader1);
     cfg.check_one_leader();
 
     // if the old leader rejoins, that shouldn't
     // disturb the new leader.
+    debug!("Test action: reconnecting leader {}", leader1);
     cfg.connect(leader1);
     let leader2 = cfg.check_one_leader();
 
     // if there's no quorum, no leader should
     // be elected.
+    let other = (leader2 + 1) % servers;
+    debug!(
+        "Test action: disconnecting leader {} and another server {}",
+        leader1, other
+    );
     cfg.disconnect(leader2);
-    cfg.disconnect((leader2 + 1) % servers);
+    cfg.disconnect(other);
     thread::sleep(2 * RAFT_ELECTION_TIMEOUT);
     cfg.check_no_leader();
 
     // if a quorum arises, it should elect a leader.
-    cfg.connect((leader2 + 1) % servers);
+    debug!("Test action: reconnecting server {}", other);
+    cfg.connect(other);
     cfg.check_one_leader();
 
     // re-join of last node shouldn't prevent leader from existing.
+    debug!("Test action: reconnecting previous leader {}", leader2);
     cfg.connect(leader2);
     cfg.check_one_leader();
 

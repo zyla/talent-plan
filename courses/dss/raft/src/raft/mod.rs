@@ -6,7 +6,7 @@ use futures::channel::mpsc::UnboundedSender;
 use futures::executor::ThreadPool;
 
 use futures::lock::{Mutex, MutexGuard};
-use futures::Future;
+use futures::{Future, FutureExt};
 
 use futures_timer::Delay;
 use std::time::Duration;
@@ -243,10 +243,10 @@ impl Node {
         let self_ = self.clone();
         let me = self_.me;
         raft.election_timer = Some(CancellableTask::spawn(&self.pool, async move {
-            let timeout = rand::thread_rng().gen_range(100, 300);
+            let mut timeout = rand::thread_rng().gen_range(100, 300);
             Delay::new(Duration::from_millis(timeout)).await;
-            println!("node {}: election timeout ({})", me, timeout);
-            {
+            loop {
+                println!("node {}: election timeout ({})", me, timeout);
                 let mut raft = self_.raft.lock().await;
                 raft.modify_state(|state| {
                     state.is_leader = false;
@@ -284,10 +284,17 @@ impl Node {
                         });
                     }
                 }
-                wg.wait().await;
-                println!("node {}: got votes, becoming a leader", me);
-
-                self_.run_leader(term).await;
+                timeout = rand::thread_rng().gen_range(100, 300);
+                select! {
+                    _ = Delay::new(Duration::from_millis(timeout)).fuse() => {
+                        // continue loop
+                    },
+                    _ = wg.wait().fuse() => {
+                        println!("node {}: got votes, becoming a leader", me);
+                        self_.run_leader(term).await;
+                        break;
+                    }
+                }
             }
         }));
     }
@@ -433,14 +440,14 @@ impl RaftService for Node {
                 term: raft.state.term,
             })
         } else if args.term == raft.state.term {
-            raft.election_timer = None;
+            self.start_election_timer(raft);
             Ok(AppendEntriesReply { term: args.term })
         } else {
-            raft.election_timer = None;
             raft.modify_state(|state| {
                 state.is_leader = false;
                 state.term = args.term;
             });
+            self.start_election_timer(raft);
             Ok(AppendEntriesReply { term: args.term })
         };
         println!("node {} responds with {:?}", self.me, response);

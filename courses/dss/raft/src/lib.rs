@@ -7,6 +7,9 @@ extern crate log;
 #[macro_use]
 extern crate prost_derive;
 
+#[macro_use]
+extern crate futures;
+
 pub mod kvraft;
 mod proto;
 pub mod raft;
