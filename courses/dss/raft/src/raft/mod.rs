@@ -254,7 +254,7 @@ impl Node {
                 self_1.pool.spawn_ok(async move {
                     let mut raft = self_.raft.lock().await;
                     raft.modify_state(|state| {
-                        state.is_leader = true;
+                        state.is_leader = false;
                         state.term += 1;
                     });
                     let term = raft.state.term;
