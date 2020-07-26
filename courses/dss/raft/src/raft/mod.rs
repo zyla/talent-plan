@@ -11,7 +11,7 @@ use futures::{Future, FutureExt};
 use futures_timer::Delay;
 use std::time::Duration;
 
-use std::cmp::Ordering;
+use std::cmp::{max, min, Ordering};
 
 #[cfg(test)]
 pub mod config;
@@ -61,12 +61,14 @@ pub struct Raft {
     me: usize,
     state: Arc<State>,
     vote: Option<usize>,
-    // Your data here (2A, 2B, 2C).
-    // Look at the paper's Figure 2 for a description of what
-    // state a Raft server must maintain.
     apply_ch: UnboundedSender<ApplyMsg>,
     election_timer: Option<CancellableTask>,
     heartbeat_task: Option<CancellableTask>,
+    log: Vec<Entry>,
+    commit_index: usize,
+    last_applied: usize,
+    next_index: Vec<usize>,
+    match_index: Vec<usize>,
 }
 
 struct CancellableTask {
@@ -119,6 +121,9 @@ impl Raft {
     ) -> Raft {
         let raft_state = persister.raft_state();
 
+        let next_index = peers.iter().map(|_| 0).collect();
+        let match_index = peers.iter().map(|_| 0).collect();
+
         // Your initialization code here (2A, 2B, 2C).
         let mut rf = Raft {
             peers,
@@ -129,6 +134,11 @@ impl Raft {
             apply_ch,
             election_timer: None,
             heartbeat_task: None,
+            log: vec![],
+            commit_index: 0,
+            last_applied: 0,
+            next_index,
+            match_index,
         };
 
         // initialize from state persisted before a crash
@@ -167,24 +177,6 @@ impl Raft {
         // }
     }
 
-    fn start<M>(&self, command: &M) -> Result<(u64, u64)>
-    where
-        M: labcodec::Message,
-    {
-        let index = 0;
-        let term = 0;
-        let is_leader = true;
-        let mut buf = vec![];
-        labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
-        // Your code here (2B).
-
-        if is_leader {
-            Ok((index, term))
-        } else {
-            Err(Error::NotLeader)
-        }
-    }
-
     fn modify_state(&mut self, f: impl Fn(&mut State) -> ()) {
         let mut state = (*self.state).clone();
         f(&mut state);
@@ -196,12 +188,11 @@ impl Raft {
     /// Only for suppressing deadcode warnings.
     #[doc(hidden)]
     pub fn __suppress_deadcode(&mut self) {
-        let _ = self.start(&0);
         self.persist();
-        let _ = &self.state;
-        let _ = &self.me;
         let _ = &self.persister;
-        let _ = &self.peers;
+        let _ = &self.apply_ch;
+        let _ = &self.last_applied;
+        let _ = &self.match_index;
     }
 }
 
@@ -222,6 +213,7 @@ impl Raft {
 #[derive(Clone)]
 pub struct Node {
     me: usize,
+    name: String,
     raft: Arc<Mutex<Raft>>,
     pool: Arc<ThreadPool>,
 }
@@ -231,6 +223,7 @@ impl Node {
     pub fn new(raft: Raft) -> Node {
         let node = Node {
             me: raft.me,
+            name: format!("node {}", raft.me),
             raft: Arc::new(Mutex::new(raft)),
             pool: Arc::new(ThreadPool::new().unwrap()),
         };
@@ -299,7 +292,6 @@ impl Node {
     }
 
     async fn run_leader(&self, term: u64) {
-        let me = self.me;
         let mut raft = self.raft.lock().await;
         if raft.state.term != term {
             warn!(
@@ -312,20 +304,10 @@ impl Node {
             state.is_leader = true;
         });
 
-        let _self_ = self.clone();
-
-        let peers = raft.peers.clone();
+        let self_ = self.clone();
         raft.heartbeat_task = Some(CancellableTask::spawn(&self.pool, async move {
             loop {
-                debug!("node {}: sending heartbeats", me);
-                for (index, peer) in peers.iter().enumerate() {
-                    if index != me {
-                        let peer_clone = peer.clone();
-                        peer.spawn(async move {
-                            let _ = peer_clone.append_entries(&AppendEntriesArgs { term }).await;
-                        });
-                    }
-                }
+                self_.send_log_entries().await;
                 Delay::new(Duration::from_millis(100)).await;
             }
         }));
@@ -343,20 +325,132 @@ impl Node {
     /// at if it's ever committed. the second is the current term.
     ///
     /// This method must return without blocking on the raft.
-    pub fn start<M>(&self, _command: &M) -> Result<(u64, u64)>
+    pub fn start<M>(&self, command: &M) -> Result<(u64, u64)>
     where
         M: labcodec::Message,
     {
+        let self_ = self.clone();
         futures::executor::block_on(async move {
-            let raft = self.raft.lock().await;
-            let _ = raft.apply_ch;
-            if raft.state.is_leader {
-                unimplemented!()
-            } else {
-                // TODO: What to do when election is in progress?
-                Err(Error::NotLeader)
+            let mut raft = self_.raft.lock().await;
+            if !raft.state.is_leader {
+                return Err(Error::NotLeader);
             }
+            let term = raft.state.term;
+            let mut buf = vec![];
+            labcodec::encode(command, &mut buf).expect("message should encode without trouble");
+            let index = raft.log.len() as u64 + 1;
+            raft.log.push(Entry { term, command: buf });
+
+            let self_1 = self_.clone();
+            self_.pool.spawn_ok(async move {
+                self_1.send_log_entries().await;
+            });
+
+            Ok((index, term))
         })
+    }
+
+    async fn send_log_entries(&self) {
+        let me = self.me;
+        let raft = self.raft.lock().await;
+        let term = raft.state.term;
+        if !raft.state.is_leader {
+            warn!(
+                "node {}: send_log_entries: no longer a leader, current term is {}",
+                me, raft.state.term
+            );
+            return;
+        }
+        debug!("node {}: sending log entries (term {})", me, term);
+
+        for (peer_index, peer) in raft.peers.iter().enumerate() {
+            if peer_index == me {
+                continue;
+            }
+            let peer_clone = peer.clone();
+            let self_ = self.clone();
+            let send_index = min(
+                raft.log.len() + 1,
+                max(
+                    raft.next_index[peer_index],
+                    raft.match_index[peer_index] + 1,
+                ),
+            );
+            debug!("node {}: send_index[{}] = {}", me, peer_index, send_index);
+            let msg = AppendEntriesArgs {
+                term,
+                prev_log_index: send_index.saturating_sub(1) as u64,
+                prev_log_term: if send_index <= 1 {
+                    0
+                } else {
+                    raft.log[send_index - 2].term as u64
+                },
+                entries: if send_index == 0 {
+                    vec![]
+                } else {
+                    raft.log[send_index - 1..].to_vec()
+                },
+                leader_commit: raft.commit_index as u64,
+            };
+            peer.spawn(async move {
+                if let Ok(AppendEntriesReply {
+                    term: reply_term,
+                    success: true,
+                }) = peer_clone.append_entries(&msg).await
+                {
+                    if reply_term != term {
+                        warn!("node {} got stale AppendEntriesEntry", me);
+                        return;
+                    }
+                    let mut raft = self_.raft.lock().await;
+                    raft.match_index[peer_index] =
+                        min(raft.log.len(), send_index + msg.entries.len());
+                    raft.next_index[peer_index] = raft.match_index[peer_index] + 1;
+                    debug!(
+                        "node {}: updated peer state [{}]: match_index = {}, next_index = {}",
+                        me, peer_index, raft.match_index[peer_index], raft.next_index[peer_index]
+                    );
+                    self_.advance_commit_index_leader(raft);
+                }
+            });
+        }
+    }
+
+    fn advance_commit_index_leader(&self, mut raft: MutexGuard<Raft>) {
+        let replicas_needed = raft.peers.len() / 2;
+        while raft.commit_index < raft.log.len() {
+            let n = raft.commit_index + 1;
+            if raft.log[n - 1].term != raft.state.term {
+                continue;
+            }
+            let num_replicas = raft
+                .match_index
+                .iter()
+                .filter(|match_index| match_index >= &&n)
+                .count();
+            if num_replicas > replicas_needed {
+                debug!("node {} committing log entry {}", raft.me, n);
+                raft.commit_index += 1;
+            } else {
+                break;
+            }
+        }
+        self.advance_state_machine(&mut raft);
+    }
+
+    fn advance_state_machine(&self, raft: &mut MutexGuard<Raft>) {
+        while raft.last_applied < raft.commit_index {
+            let n = raft.last_applied + 1;
+            debug!("node {} applying log entry {}", raft.me, n);
+            raft.apply_ch
+                .unbounded_send(ApplyMsg {
+                    command_valid: true,
+                    command: raft.log[n - 1].command.clone(),
+                    command_index: n as u64,
+                })
+                .expect("send should succeed");
+            raft.last_applied += 1;
+        }
     }
 
     /// The current term of this peer.
@@ -389,14 +483,14 @@ impl Node {
 
 #[async_trait::async_trait]
 impl RaftService for Node {
-    // example RequestVote RPC handler.
-    //
-    // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
-        debug!("node {} got {:?}", self.me, args);
         let mut raft = self.raft.lock().await;
         let candidate = args.candidate_id as usize;
-        let response = match args.term.cmp(&raft.state.term) {
+        match args.term.cmp(&raft.state.term) {
             Ordering::Less => Ok(RequestVoteReply {
                 term: raft.state.term,
                 vote_granted: false,
@@ -425,32 +519,40 @@ impl RaftService for Node {
                     vote_granted: true,
                 })
             }
-        };
-        debug!("node {} responds with {:?}", self.me, response);
-        response
+        }
     }
 
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
-        debug!("node {} got {:?}", self.me, args);
         let mut raft = self.raft.lock().await;
-        let response = match args.term.cmp(&raft.state.term) {
-            Ordering::Less => Ok(AppendEntriesReply {
+        let current_term = raft.state.term;
+        if args.term < current_term {
+            return Ok(AppendEntriesReply {
                 term: raft.state.term,
-            }),
-            Ordering::Equal => {
-                self.start_election_timer(raft);
-                Ok(AppendEntriesReply { term: args.term })
-            }
-            Ordering::Greater => {
-                raft.modify_state(|state| {
-                    state.is_leader = false;
-                    state.term = args.term;
-                });
-                self.start_election_timer(raft);
-                Ok(AppendEntriesReply { term: args.term })
-            }
-        };
-        debug!("node {} responds with {:?}", self.me, response);
-        response
+                success: false,
+            });
+        }
+        if args.term < current_term {
+            raft.modify_state(|state| {
+                state.is_leader = false;
+                state.term = args.term;
+            });
+            raft.heartbeat_task = None;
+        }
+
+        // TODO: term check
+
+        raft.log.truncate(args.prev_log_index as usize);
+        raft.log.extend_from_slice(&args.entries);
+
+        raft.commit_index = min(raft.log.len(), args.leader_commit as usize);
+
+        self.advance_state_machine(&mut raft);
+
+        self.start_election_timer(raft);
+
+        Ok(AppendEntriesReply {
+            term: args.term,
+            success: true,
+        })
     }
 }

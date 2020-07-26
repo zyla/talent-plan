@@ -27,6 +27,11 @@ macro_rules! service {
                     $(#[$method_attr])*
                     async fn $method_name(&self, req: $input) -> $crate::Result<$output>;
                 )*
+
+                /// Returns the node name.
+                fn name(&self) -> &str {
+                    ""
+                }
             }
 
             #[derive(Clone)]
@@ -67,11 +72,13 @@ macro_rules! service {
                                             $crate::Error::Decode(e)
                                         )),
                                     };
+                                    log::debug!("{} received {:?}", s.name(), request);
                                     Box::pin(async move {
                                         let f = s.$method_name(request);
                                         let resp = f.await;
                                         match resp {
                                             Ok(resp) => {
+                                                log::debug!("{} responds with {:?}", s.name(), resp);
                                                 let mut rsp = vec![];
                                                 labcodec::encode(&resp, &mut rsp).map_err($crate::Error::Encode)?;
                                                 Ok(rsp)
