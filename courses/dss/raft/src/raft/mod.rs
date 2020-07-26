@@ -11,6 +11,8 @@ use futures::{Future, FutureExt};
 use futures_timer::Delay;
 use std::time::Duration;
 
+use std::cmp::Ordering;
+
 #[cfg(test)]
 pub mod config;
 pub mod errors;
@@ -246,7 +248,7 @@ impl Node {
             let mut timeout = rand::thread_rng().gen_range(100, 300);
             Delay::new(Duration::from_millis(timeout)).await;
             loop {
-                println!("node {}: election timeout ({})", me, timeout);
+                debug!("node {}: election timeout ({})", me, timeout);
                 let mut raft = self_.raft.lock().await;
                 raft.modify_state(|state| {
                     state.is_leader = false;
@@ -255,7 +257,7 @@ impl Node {
                 let term = raft.state.term;
                 let peers = raft.peers.clone();
                 let votes_needed = peers.len() / 2;
-                println!(
+                debug!(
                     "node {}: starting election, waiting for {} votes",
                     me, votes_needed
                 );
@@ -267,19 +269,16 @@ impl Node {
                         let peer_clone = peer.clone();
                         let wg = wg.clone();
                         peer.spawn(async move {
-                            match peer_clone
+                            if let Ok(RequestVoteReply {
+                                vote_granted: true, ..
+                            }) = peer_clone
                                 .request_vote(&RequestVoteArgs {
                                     candidate_id: me as u64,
                                     term,
                                 })
                                 .await
                             {
-                                Ok(RequestVoteReply {
-                                    vote_granted: true, ..
-                                }) => {
-                                    wg.done();
-                                }
-                                _ => {}
+                                wg.done();
                             }
                         });
                     }
@@ -290,7 +289,7 @@ impl Node {
                         // continue loop
                     },
                     _ = wg.wait().fuse() => {
-                        println!("node {}: got votes, becoming a leader", me);
+                        debug!("node {}: got votes, becoming a leader", me);
                         self_.run_leader(term).await;
                         break;
                     }
@@ -318,15 +317,12 @@ impl Node {
         let peers = raft.peers.clone();
         raft.heartbeat_task = Some(CancellableTask::spawn(&self.pool, async move {
             loop {
-                println!("node {}: sending heartbeats", me);
+                debug!("node {}: sending heartbeats", me);
                 for (index, peer) in peers.iter().enumerate() {
                     if index != me {
                         let peer_clone = peer.clone();
                         peer.spawn(async move {
-                            match peer_clone.append_entries(&AppendEntriesArgs { term }).await {
-                                Ok(AppendEntriesReply { .. }) => {}
-                                _ => {}
-                            }
+                            let _ = peer_clone.append_entries(&AppendEntriesArgs { term }).await;
                         });
                     }
                 }
@@ -397,60 +393,64 @@ impl RaftService for Node {
     //
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
-        println!("node {} got {:?}", self.me, args);
+        debug!("node {} got {:?}", self.me, args);
         let mut raft = self.raft.lock().await;
         let candidate = args.candidate_id as usize;
-        let response = if args.term < raft.state.term {
-            Ok(RequestVoteReply {
+        let response = match args.term.cmp(&raft.state.term) {
+            Ordering::Less => Ok(RequestVoteReply {
                 term: raft.state.term,
                 vote_granted: false,
-            })
-        } else if args.term == raft.state.term {
-            let vote_granted = match raft.vote {
-                Some(other) if other != candidate => false,
-                _ => {
-                    raft.vote = Some(candidate);
-                    true
-                }
-            };
-            Ok(RequestVoteReply {
-                term: args.term,
-                vote_granted,
-            })
-        } else {
-            raft.modify_state(|state| {
-                state.is_leader = false;
-                state.term = args.term;
-            });
-            raft.vote = Some(candidate);
-            Ok(RequestVoteReply {
-                term: args.term,
-                vote_granted: true,
-            })
+            }),
+            Ordering::Equal => {
+                let vote_granted = match raft.vote {
+                    Some(other) if other != candidate => false,
+                    _ => {
+                        raft.vote = Some(candidate);
+                        true
+                    }
+                };
+                Ok(RequestVoteReply {
+                    term: args.term,
+                    vote_granted,
+                })
+            }
+            Ordering::Greater => {
+                raft.modify_state(|state| {
+                    state.is_leader = false;
+                    state.term = args.term;
+                });
+                raft.vote = Some(candidate);
+                Ok(RequestVoteReply {
+                    term: args.term,
+                    vote_granted: true,
+                })
+            }
         };
-        println!("node {} responds with {:?}", self.me, response);
+        debug!("node {} responds with {:?}", self.me, response);
         response
     }
 
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
-        println!("node {} got {:?}", self.me, args);
+        debug!("node {} got {:?}", self.me, args);
         let mut raft = self.raft.lock().await;
-        let response = if args.term < raft.state.term {
-            Ok(AppendEntriesReply {
+        let response = match args.term.cmp(&raft.state.term) {
+            Ordering::Less => Ok(AppendEntriesReply {
                 term: raft.state.term,
-            })
-        } else if args.term == raft.state.term {
-            self.start_election_timer(raft);
-            Ok(AppendEntriesReply { term: args.term })
-        } else {
-            raft.modify_state(|state| {
-                state.is_leader = false;
-                state.term = args.term;
-            });
-            self.start_election_timer(raft);
-            Ok(AppendEntriesReply { term: args.term })
+            }),
+            Ordering::Equal => {
+                self.start_election_timer(raft);
+                Ok(AppendEntriesReply { term: args.term })
+            }
+            Ordering::Greater => {
+                raft.modify_state(|state| {
+                    state.is_leader = false;
+                    state.term = args.term;
+                });
+                self.start_election_timer(raft);
+                Ok(AppendEntriesReply { term: args.term })
+            }
         };
-        println!("node {} responds with {:?}", self.me, response);
+        debug!("node {} responds with {:?}", self.me, response);
         response
     }
 }
