@@ -330,24 +330,27 @@ impl Node {
         M: labcodec::Message,
     {
         let self_ = self.clone();
-        futures::executor::block_on(async move {
-            let mut raft = self_.raft.lock().await;
-            if !raft.state.is_leader {
-                return Err(Error::NotLeader);
+        let mut raft = loop {
+            match self_.raft.try_lock() {
+                Some(raft) => break raft,
+                None => continue,
             }
-            let term = raft.state.term;
-            let mut buf = vec![];
-            labcodec::encode(command, &mut buf).expect("message should encode without trouble");
-            let index = raft.log.len() as u64 + 1;
-            raft.log.push(Entry { term, command: buf });
+        };
+        if !raft.state.is_leader {
+            return Err(Error::NotLeader);
+        }
+        let term = raft.state.term;
+        let mut buf = vec![];
+        labcodec::encode(command, &mut buf).expect("message should encode without trouble");
+        let index = raft.log.len() as u64 + 1;
+        raft.log.push(Entry { term, command: buf });
 
-            let self_1 = self_.clone();
-            self_.pool.spawn_ok(async move {
-                self_1.send_log_entries().await;
-            });
+        let self_1 = self_.clone();
+        self_.pool.spawn_ok(async move {
+            self_1.send_log_entries().await;
+        });
 
-            Ok((index, term))
-        })
+        Ok((index, term))
     }
 
     async fn send_log_entries(&self) {
