@@ -241,20 +241,18 @@ impl Node {
     }
 
     fn start_election_timer(&mut self) {
-        let me = self.me;
-        // TODO: come up with some "scoped tasks" approach, to avoid cloning Arcs like crazy
-        let raft = self.raft.clone();
-        let raft2 = self.raft.clone();
-        let pool = self.pool.clone();
-        let pool2 = self.pool.clone();
+        let self_ = self.clone();
         self.pool.spawn_ok(async move {
-            let mut raft = raft.lock().await;
-            raft.election_timer = Some(CancellableTask::spawn(&pool, async move {
+            let me = self_.me;
+            let self_1 = self_.clone();
+            let mut raft = self_1.raft.lock().await;
+            raft.election_timer = Some(CancellableTask::spawn(&self_1.pool, async move {
+                let self_1 = self_.clone();
                 let timeout = rand::thread_rng().gen_range(100, 300);
                 Delay::new(Duration::from_millis(timeout)).await;
                 println!("node {}: election timeout ({})", me, timeout);
-                pool2.spawn_ok(async move {
-                    let mut raft = raft2.lock().await;
+                self_1.pool.spawn_ok(async move {
+                    let mut raft = self_.raft.lock().await;
                     raft.modify_state(|state| {
                         state.is_leader = true;
                         state.term += 1;
@@ -292,7 +290,7 @@ impl Node {
                     wg.wait().await;
                     println!("node {}: got votes, becoming a leader", me);
 
-                    let mut raft = raft2.lock().await;
+                    let mut raft = self_.raft.lock().await;
                     raft.modify_state(|state| { state.is_leader = true; });
                 });
             }));
