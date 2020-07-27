@@ -279,6 +279,7 @@ impl Config {
                 if self.connected[starts] {
                     let rafts = self.rafts.lock().unwrap();
                     if let Some(ref rf) = &rafts[starts] {
+                        debug!("Test action: issuing start({:?}) on node {}", cmd, starts);
                         match rf.start(&cmd) {
                             Ok((index1, _)) => {
                                 index = Some(index1);

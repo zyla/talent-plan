@@ -11,7 +11,7 @@ use futures::{Future, FutureExt};
 use futures_timer::Delay;
 use std::time::Duration;
 
-use std::cmp::{max, min, Ordering};
+use std::cmp::{max, min};
 
 #[cfg(test)]
 pub mod config;
@@ -104,6 +104,9 @@ impl CancellableTask {
     }
 }
 
+const ELECTION_TIMEOUT_MIN: u64 = 300;
+const ELECTION_TIMEOUT_MAX: u64 = 500;
+
 impl Raft {
     /// the service or tester wants to create a Raft server. the ports
     /// of all the Raft servers (including this one) are in peers. this
@@ -182,6 +185,14 @@ impl Raft {
         f(&mut state);
         self.state = Arc::new(state);
     }
+
+    fn become_follower(&mut self, term: u64) {
+        self.modify_state(|state| {
+            state.is_leader = false;
+            state.term = term;
+        });
+        self.heartbeat_task = None;
+    }
 }
 
 impl Raft {
@@ -229,16 +240,16 @@ impl Node {
         };
         let node_ = node.clone();
         node.pool.spawn_ok(async move {
-            node_.start_election_timer(node_.clone().raft.lock().await);
+            node_.start_election_timer(&mut node_.clone().raft.lock().await);
         });
         node
     }
 
-    fn start_election_timer(&self, mut raft: MutexGuard<Raft>) {
+    fn start_election_timer(&self, raft: &mut MutexGuard<Raft>) {
         let self_ = self.clone();
         let me = self_.me;
         raft.election_timer = Some(CancellableTask::spawn(&self.pool, async move {
-            let mut timeout = rand::thread_rng().gen_range(100, 300);
+            let mut timeout = rand::thread_rng().gen_range(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
             Delay::new(Duration::from_millis(timeout)).await;
             loop {
                 debug!("node {}: election timeout ({})", me, timeout);
@@ -247,6 +258,7 @@ impl Node {
                     state.is_leader = false;
                     state.term += 1;
                 });
+                raft.vote = Some(me);
                 let term = raft.state.term;
                 let peers = raft.peers.clone();
                 let votes_needed = peers.len() / 2;
@@ -254,6 +266,8 @@ impl Node {
                     "node {}: starting election, waiting for {} votes",
                     me, votes_needed
                 );
+                let last_log_index = raft.log.len() as u64;
+                let last_log_term = if last_log_index > 0 { raft.log[last_log_index as usize - 1].term } else { 0 } as u64;
                 drop(raft);
 
                 let wg = Arc::new(WaitGroup::new(votes_needed));
@@ -268,15 +282,18 @@ impl Node {
                                 .request_vote(&RequestVoteArgs {
                                     candidate_id: me as u64,
                                     term,
+                                    last_log_index,
+                                    last_log_term,
                                 })
                                 .await
                             {
+                                // FIXME: check term number
                                 wg.done();
                             }
                         });
                     }
                 }
-                timeout = rand::thread_rng().gen_range(100, 300);
+                timeout = rand::thread_rng().gen_range(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
                 select! {
                     _ = Delay::new(Duration::from_millis(timeout)).fuse() => {
                         // continue loop
@@ -327,15 +344,10 @@ impl Node {
     /// This method must return without blocking on the raft.
     pub fn start<M>(&self, command: &M) -> Result<(u64, u64)>
     where
-        M: labcodec::Message,
+        M: labcodec::Message + std::fmt::Debug,
     {
         let self_ = self.clone();
-        let mut raft = loop {
-            match self_.raft.try_lock() {
-                Some(raft) => break raft,
-                None => continue,
-            }
-        };
+        let mut raft = async_std::task::block_on(self_.raft.lock());
         if !raft.state.is_leader {
             return Err(Error::NotLeader);
         }
@@ -344,6 +356,7 @@ impl Node {
         labcodec::encode(command, &mut buf).expect("message should encode without trouble");
         let index = raft.log.len() as u64 + 1;
         raft.log.push(Entry { term, command: buf });
+        debug!("node {} added log entry {:?} at index {}", raft.me, command, index);
 
         let self_1 = self_.clone();
         self_.pool.spawn_ok(async move {
@@ -401,8 +414,14 @@ impl Node {
                     success: true,
                 }) = peer_clone.append_entries(&msg).await
                 {
-                    if reply_term != term {
+                    if reply_term < term {
                         warn!("node {} got stale AppendEntriesEntry", me);
+                        return;
+                    } else if reply_term > term {
+                        warn!("node {} got AppendEntriesEntry with newer term; becoming follower", me);
+                        let mut raft = self_.raft.lock().await;
+                        raft.become_follower(reply_term);
+                        self_.start_election_timer(&mut raft);
                         return;
                     }
                     let mut raft = self_.raft.lock().await;
@@ -429,12 +448,13 @@ impl Node {
             let num_replicas = raft
                 .match_index
                 .iter()
-                .filter(|match_index| match_index >= &&n)
+                .filter(|match_index| **match_index >= n)
                 .count();
-            if num_replicas > replicas_needed {
+            if num_replicas >= replicas_needed {
                 debug!("node {} committing log entry {}", raft.me, n);
                 raft.commit_index += 1;
             } else {
+                debug!("node {}: log entry {} is on {}/{} replicas, not committing", raft.me, n, num_replicas, replicas_needed);
                 break;
             }
         }
@@ -492,37 +512,34 @@ impl RaftService for Node {
 
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
         let mut raft = self.raft.lock().await;
+        let current_term = raft.state.term;
         let candidate = args.candidate_id as usize;
-        match args.term.cmp(&raft.state.term) {
-            Ordering::Less => Ok(RequestVoteReply {
+        if args.term < current_term {
+            return Ok(RequestVoteReply {
                 term: raft.state.term,
                 vote_granted: false,
-            }),
-            Ordering::Equal => {
-                let vote_granted = match raft.vote {
-                    Some(other) if other != candidate => false,
-                    _ => {
-                        raft.vote = Some(candidate);
-                        true
-                    }
-                };
-                Ok(RequestVoteReply {
-                    term: args.term,
-                    vote_granted,
-                })
-            }
-            Ordering::Greater => {
-                raft.modify_state(|state| {
-                    state.is_leader = false;
-                    state.term = args.term;
-                });
-                raft.vote = Some(candidate);
-                Ok(RequestVoteReply {
-                    term: args.term,
-                    vote_granted: true,
-                })
-            }
+            });
         }
+        if args.term > current_term {
+            raft.become_follower(args.term);
+            raft.vote = None;
+        }
+
+        let last_log_index = raft.log.len() as u64;
+        let last_log_term = if last_log_index > 0 { raft.log[last_log_index as usize - 1].term } else { 0 } as u64;
+        let vote_granted = match raft.vote {
+            Some(other) if other != candidate => false,
+            _ if args.last_log_term < last_log_term => false,
+            _ if args.last_log_term == last_log_term && args.last_log_index < last_log_index => false,
+            _ => {
+                raft.vote = Some(candidate);
+                true
+            }
+        };
+        Ok(RequestVoteReply {
+            term: args.term,
+            vote_granted,
+        })
     }
 
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
@@ -534,15 +551,10 @@ impl RaftService for Node {
                 success: false,
             });
         }
-        if args.term < current_term {
-            raft.modify_state(|state| {
-                state.is_leader = false;
-                state.term = args.term;
-            });
-            raft.heartbeat_task = None;
+        if args.term > current_term {
+            raft.become_follower(args.term);
+            raft.vote = None;
         }
-
-        // TODO: term check
 
         raft.log.truncate(args.prev_log_index as usize);
         raft.log.extend_from_slice(&args.entries);
@@ -550,8 +562,7 @@ impl RaftService for Node {
         raft.commit_index = min(raft.log.len(), args.leader_commit as usize);
 
         self.advance_state_machine(&mut raft);
-
-        self.start_election_timer(raft);
+        self.start_election_timer(&mut raft);
 
         Ok(AppendEntriesReply {
             term: args.term,

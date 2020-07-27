@@ -119,7 +119,18 @@ fn test_basic_agree_2b() {
 }
 
 #[test]
-fn test_fail_agree_2b() {
+fn test_two_entries_2b() {
+    let servers = 3;
+    let mut cfg = Config::new(servers, false);
+
+    cfg.begin("Test (2B): two agreements in a row");
+
+    cfg.one(Entry { x: 101 }, servers, false);
+    cfg.one(Entry { x: 102 }, servers, false);
+}
+
+#[test]
+fn test_basic_agreement_after_failure_2b() {
     let servers = 3;
     let mut cfg = Config::new(servers, false);
 
@@ -133,11 +144,30 @@ fn test_fail_agree_2b() {
 
     // agree despite one disconnected server?
     cfg.one(Entry { x: 102 }, servers - 1, false);
+}
+
+#[test]
+fn test_fail_agree_2b() {
+    let servers = 3;
+    let mut cfg = Config::new(servers, false);
+
+    cfg.begin("Test (2B): agreement despite follower disconnection");
+
+    cfg.one(Entry { x: 101 }, servers, false);
+
+    // follower network disconnection
+    let leader = cfg.check_one_leader();
+    debug!("Test action: disconnecting follower");
+    cfg.disconnect((leader + 1) % servers);
+
+    // agree despite one disconnected server?
+    cfg.one(Entry { x: 102 }, servers - 1, false);
     cfg.one(Entry { x: 103 }, servers - 1, false);
     thread::sleep(RAFT_ELECTION_TIMEOUT);
     cfg.one(Entry { x: 104 }, servers - 1, false);
     cfg.one(Entry { x: 105 }, servers - 1, false);
 
+    debug!("Test action: reconnecting follower");
     // re-connect
     cfg.connect((leader + 1) % servers);
 
