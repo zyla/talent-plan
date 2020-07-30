@@ -392,7 +392,6 @@ impl Node {
                     raft.match_index[peer_index] + 1,
                 ),
             );
-            debug!("node {}: send_index[{}] = {}", me, peer_index, send_index);
             let msg = AppendEntriesArgs {
                 term,
                 prev_log_index: send_index.saturating_sub(1) as u64,
@@ -408,6 +407,8 @@ impl Node {
                 },
                 leader_commit: raft.commit_index as u64,
             };
+            let match_index = min(raft.log.len(), send_index + msg.entries.len());
+            debug!("node {}: send_index[{}] = {}, match_index = {}", me, peer_index, send_index, match_index);
             peer.spawn(async move {
                 if let Ok(AppendEntriesReply {
                     term: reply_term,
@@ -425,8 +426,10 @@ impl Node {
                         return;
                     }
                     let mut raft = self_.raft.lock().await;
-                    raft.match_index[peer_index] =
-                        min(raft.log.len(), send_index + msg.entries.len());
+                    if raft.match_index[peer_index] >= match_index {
+                        return;
+                    }
+                    raft.match_index[peer_index] = match_index;
                     raft.next_index[peer_index] = raft.match_index[peer_index] + 1;
                     debug!(
                         "node {}: updated peer state [{}]: match_index = {}, next_index = {}",
