@@ -249,7 +249,8 @@ impl Node {
         let self_ = self.clone();
         let me = self_.me;
         raft.election_timer = Some(CancellableTask::spawn(&self.pool, async move {
-            let mut timeout = rand::thread_rng().gen_range(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
+            let mut timeout =
+                rand::thread_rng().gen_range(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
             Delay::new(Duration::from_millis(timeout)).await;
             loop {
                 debug!("node {}: election timeout ({})", me, timeout);
@@ -267,7 +268,11 @@ impl Node {
                     me, votes_needed
                 );
                 let last_log_index = raft.log.len() as u64;
-                let last_log_term = if last_log_index > 0 { raft.log[last_log_index as usize - 1].term } else { 0 } as u64;
+                let last_log_term = if last_log_index > 0 {
+                    raft.log[last_log_index as usize - 1].term
+                } else {
+                    0
+                } as u64;
                 drop(raft);
 
                 let wg = Arc::new(WaitGroup::new(votes_needed));
@@ -356,7 +361,10 @@ impl Node {
         labcodec::encode(command, &mut buf).expect("message should encode without trouble");
         let index = raft.log.len() as u64 + 1;
         raft.log.push(Entry { term, command: buf });
-        debug!("node {} added log entry {:?} at index {}", raft.me, command, index);
+        debug!(
+            "node {} added log entry {:?} at index {}",
+            raft.me, command, index
+        );
 
         let self_1 = self_.clone();
         self_.pool.spawn_ok(async move {
@@ -408,7 +416,10 @@ impl Node {
                 leader_commit: raft.commit_index as u64,
             };
             let match_index = min(raft.log.len(), send_index + msg.entries.len());
-            debug!("node {}: send_index[{}] = {}, match_index = {}", me, peer_index, send_index, match_index);
+            debug!(
+                "node {}: send_index[{}] = {}, match_index = {}",
+                me, peer_index, send_index, match_index
+            );
             peer.spawn(async move {
                 if let Ok(AppendEntriesReply {
                     term: reply_term,
@@ -418,8 +429,12 @@ impl Node {
                     if reply_term < term {
                         warn!("node {} got stale AppendEntriesEntry", me);
                         return;
-                    } else if reply_term > term {
-                        warn!("node {} got AppendEntriesEntry with newer term; becoming follower", me);
+                    }
+                    if reply_term > term {
+                        warn!(
+                            "node {} got AppendEntriesEntry with newer term; becoming follower",
+                            me
+                        );
                         let mut raft = self_.raft.lock().await;
                         raft.become_follower(reply_term);
                         self_.start_election_timer(&mut raft);
@@ -443,9 +458,10 @@ impl Node {
 
     fn advance_commit_index_leader(&self, mut raft: MutexGuard<Raft>) {
         let replicas_needed = raft.peers.len() / 2;
-        while raft.commit_index < raft.log.len() {
-            let n = raft.commit_index + 1;
+        let mut n = raft.commit_index + 1;
+        while n <= raft.log.len() {
             if raft.log[n - 1].term != raft.state.term {
+                n += 1;
                 continue;
             }
             let num_replicas = raft
@@ -455,9 +471,13 @@ impl Node {
                 .count();
             if num_replicas >= replicas_needed {
                 debug!("node {} committing log entry {}", raft.me, n);
-                raft.commit_index += 1;
+                raft.commit_index = n;
+                n += 1;
             } else {
-                debug!("node {}: log entry {} is on {}/{} replicas, not committing", raft.me, n, num_replicas, replicas_needed);
+                debug!(
+                    "node {}: log entry {} is on {}/{} replicas, not committing",
+                    raft.me, n, num_replicas, replicas_needed
+                );
                 break;
             }
         }
@@ -529,11 +549,17 @@ impl RaftService for Node {
         }
 
         let last_log_index = raft.log.len() as u64;
-        let last_log_term = if last_log_index > 0 { raft.log[last_log_index as usize - 1].term } else { 0 } as u64;
+        let last_log_term = if last_log_index > 0 {
+            raft.log[last_log_index as usize - 1].term
+        } else {
+            0
+        } as u64;
         let vote_granted = match raft.vote {
             Some(other) if other != candidate => false,
             _ if args.last_log_term < last_log_term => false,
-            _ if args.last_log_term == last_log_term && args.last_log_index < last_log_index => false,
+            _ if args.last_log_term == last_log_term && args.last_log_index < last_log_index => {
+                false
+            }
             _ => {
                 raft.vote = Some(candidate);
                 true
