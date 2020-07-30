@@ -71,6 +71,16 @@ pub struct Raft {
     match_index: Vec<usize>,
 }
 
+#[derive(::prost::Message)]
+struct PersistentState {
+    #[prost(uint64, tag = "1")]
+    current_term: u64,
+    #[prost(uint64, optional, tag = "2")]
+    voted_for: Option<u64>,
+    #[prost(message, repeated, tag = "3")]
+    log: Vec<Entry>,
+}
+
 struct CancellableTask {
     _sender: futures::channel::oneshot::Sender<()>,
 }
@@ -154,11 +164,15 @@ impl Raft {
     /// where it can later be retrieved after a crash and restart.
     /// see paper's Figure 2 for a description of what should be persistent.
     fn persist(&mut self) {
-        // Your code here (2C).
-        // Example:
-        // labcodec::encode(&self.xxx, &mut data).unwrap();
-        // labcodec::encode(&self.yyy, &mut data).unwrap();
-        // self.persister.save_raft_state(data);
+        let persistent_state = PersistentState {
+            current_term: self.state.term,
+            voted_for: self.vote.map(|x| x as u64),
+            log: self.log.clone(),
+        };
+        let mut data = vec![];
+        labcodec::encode(&persistent_state, &mut data)
+            .expect("message should encode without trouble");
+        self.persister.save_raft_state(data);
     }
 
     /// restore previously persisted state.
@@ -167,17 +181,23 @@ impl Raft {
             // bootstrap without any state?
             return;
         }
-        // Your code here (2C).
-        // Example:
-        // match labcodec::decode(data) {
-        //     Ok(o) => {
-        //         self.xxx = o.xxx;
-        //         self.yyy = o.yyy;
-        //     }
-        //     Err(e) => {
-        //         panic!("{:?}", e);
-        //     }
-        // }
+        match labcodec::decode::<PersistentState>(data) {
+            Ok(persistent_state) => {
+                debug!(
+                    "node {} restarts with state: {:?}",
+                    self.me, persistent_state
+                );
+                self.modify_state(|state| {
+                    state.is_leader = false;
+                    state.term = persistent_state.current_term;
+                });
+                self.vote = persistent_state.voted_for.map(|x| x as usize);
+                self.log = persistent_state.log;
+            }
+            Err(e) => {
+                panic!("{:?}", e);
+            }
+        }
     }
 
     fn modify_state(&mut self, f: impl Fn(&mut State) -> ()) {
@@ -191,6 +211,7 @@ impl Raft {
             state.is_leader = false;
             state.term = term;
         });
+        self.persist();
         self.heartbeat_task = None;
     }
 }
@@ -260,6 +281,7 @@ impl Node {
                     state.term += 1;
                 });
                 raft.vote = Some(me);
+                raft.persist();
                 let term = raft.state.term;
                 let peers = raft.peers.clone();
                 let votes_needed = peers.len() / 2;
@@ -325,6 +347,13 @@ impl Node {
         raft.modify_state(|state| {
             state.is_leader = true;
         });
+        let log_len = raft.log.len();
+        for next_index in raft.next_index.iter_mut() {
+            *next_index = log_len;
+        }
+        for match_index in raft.match_index.iter_mut() {
+            *match_index = 0;
+        }
 
         let self_ = self.clone();
         raft.heartbeat_task = Some(CancellableTask::spawn(&self.pool, async move {
@@ -458,6 +487,7 @@ impl Node {
 
     fn advance_commit_index_leader(&self, mut raft: MutexGuard<Raft>) {
         let replicas_needed = raft.peers.len() / 2;
+        let initial_commit_index = raft.commit_index;
         let mut n = raft.commit_index + 1;
         while n <= raft.log.len() {
             if raft.log[n - 1].term != raft.state.term {
@@ -481,6 +511,9 @@ impl Node {
                 break;
             }
         }
+        if raft.commit_index > initial_commit_index {
+            raft.persist();
+        }
         self.advance_state_machine(&mut raft);
     }
 
@@ -488,13 +521,13 @@ impl Node {
         while raft.last_applied < raft.commit_index {
             let n = raft.last_applied + 1;
             debug!("node {} applying log entry {}", raft.me, n);
-            raft.apply_ch
-                .unbounded_send(ApplyMsg {
-                    command_valid: true,
-                    command: raft.log[n - 1].command.clone(),
-                    command_index: n as u64,
-                })
-                .expect("send should succeed");
+            if raft.apply_ch.unbounded_send(ApplyMsg {
+                command_valid: true,
+                command: raft.log[n - 1].command.clone(),
+                command_index: n as u64,
+            }).is_err() {
+                warn!("node {}: apply_ch closed", raft.me);
+            }
             raft.last_applied += 1;
         }
     }
@@ -523,7 +556,11 @@ impl Node {
     /// a VIRTUAL crash in tester, so take care of background
     /// threads you generated with this Raft Node.
     pub fn kill(&self) {
-        // Your code here, if desired.
+        futures::executor::block_on(async move {
+            let mut raft = self.raft.lock().await;
+            raft.election_timer = None;
+            raft.heartbeat_task = None;
+        })
     }
 }
 
@@ -562,6 +599,7 @@ impl RaftService for Node {
             }
             _ => {
                 raft.vote = Some(candidate);
+                raft.persist();
                 true
             }
         };
@@ -581,14 +619,16 @@ impl RaftService for Node {
             });
         }
         if args.term > current_term {
-            raft.become_follower(args.term);
             raft.vote = None;
+            raft.become_follower(args.term);
         }
 
         raft.log.truncate(args.prev_log_index as usize);
         raft.log.extend_from_slice(&args.entries);
 
         raft.commit_index = min(raft.log.len(), args.leader_commit as usize);
+
+        raft.persist();
 
         self.advance_state_machine(&mut raft);
         self.start_election_timer(&mut raft);
