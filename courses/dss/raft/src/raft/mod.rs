@@ -283,7 +283,10 @@ impl Node {
         raft.election_timer = Some(CancellableTask::spawn(&self.pool, async move {
             let mut timeout =
                 rand::thread_rng().gen_range(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
-            debug!("node {}: election timer start for term {} ({})", me, initial_term, timeout);
+            debug!(
+                "node {}: election timer start for term {} ({})",
+                me, initial_term, timeout
+            );
             Delay::new(Duration::from_millis(timeout)).await;
             loop {
                 debug!("node {}: election timeout ({})", me, timeout);
@@ -333,7 +336,10 @@ impl Node {
                     }
                 }
                 timeout = rand::thread_rng().gen_range(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
-                debug!("node {}: election timer start for term {} ({})", me, term, timeout);
+                debug!(
+                    "node {}: election timer start for term {} ({})",
+                    me, term, timeout
+                );
                 select! {
                     _ = Delay::new(Duration::from_millis(timeout)).fuse() => {
                         // continue loop
@@ -463,36 +469,46 @@ impl Node {
                 me, peer_index, send_index, match_index
             );
             peer.spawn(async move {
-                if let Ok(AppendEntriesReply {
-                    term: reply_term,
-                    success: true,
-                }) = peer_clone.append_entries(&msg).await
-                {
-                    if reply_term < term {
-                        warn!("node {} got stale AppendEntriesEntry", me);
-                        return;
-                    }
-                    if reply_term > term {
-                        warn!(
-                            "node {} got AppendEntriesEntry with newer term; becoming follower",
-                            me
-                        );
+                loop {
+                    if let Ok(AppendEntriesReply { term: reply_term, success }) = peer_clone.append_entries(&msg).await {
+                        if reply_term < term {
+                            warn!("node {} got stale AppendEntriesEntry", me);
+                            return;
+                        }
+                        if reply_term > term {
+                            warn!(
+                                "node {} got AppendEntriesEntry with newer term; becoming follower",
+                                me
+                            );
+                            let mut raft = self_.raft.lock().await;
+                            raft.become_follower(reply_term);
+                            self_.start_election_timer(&mut raft);
+                            return;
+                        }
                         let mut raft = self_.raft.lock().await;
-                        raft.become_follower(reply_term);
-                        self_.start_election_timer(&mut raft);
-                        return;
+                        if raft.state.term > term {
+                            return;
+                        }
+                        if raft.match_index[peer_index] >= match_index {
+                            return;
+                        }
+                        if success {
+                            raft.match_index[peer_index] = match_index;
+                            raft.next_index[peer_index] = raft.match_index[peer_index] + 1;
+                            debug!(
+                                "node {}: updated peer state [{}]: match_index = {}, next_index = {}",
+                                me, peer_index, raft.match_index[peer_index], raft.next_index[peer_index]
+                            );
+                            self_.advance_commit_index_leader(raft);
+                            break;
+                        } else {
+                            raft.next_index[peer_index] = raft.next_index[peer_index] - 1;
+                            debug!(
+                                "node {}: peer {} has stale log: match_index = {}, next_index = {}",
+                                me, peer_index, raft.match_index[peer_index], raft.next_index[peer_index]
+                            );
+                        }
                     }
-                    let mut raft = self_.raft.lock().await;
-                    if raft.match_index[peer_index] >= match_index {
-                        return;
-                    }
-                    raft.match_index[peer_index] = match_index;
-                    raft.next_index[peer_index] = raft.match_index[peer_index] + 1;
-                    debug!(
-                        "node {}: updated peer state [{}]: match_index = {}, next_index = {}",
-                        me, peer_index, raft.match_index[peer_index], raft.next_index[peer_index]
-                    );
-                    self_.advance_commit_index_leader(raft);
                 }
             });
         }
@@ -534,11 +550,15 @@ impl Node {
         while raft.last_applied < raft.commit_index {
             let n = raft.last_applied + 1;
             debug!("node {} applying log entry {}", raft.me, n);
-            if raft.apply_ch.unbounded_send(ApplyMsg {
-                command_valid: true,
-                command: raft.log[n - 1].command.clone(),
-                command_index: n as u64,
-            }).is_err() {
+            if raft
+                .apply_ch
+                .unbounded_send(ApplyMsg {
+                    command_valid: true,
+                    command: raft.log[n - 1].command.clone(),
+                    command_index: n as u64,
+                })
+                .is_err()
+            {
                 warn!("node {}: apply_ch closed", raft.me);
             }
             raft.last_applied += 1;
