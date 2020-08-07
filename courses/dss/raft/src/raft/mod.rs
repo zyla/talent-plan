@@ -214,6 +214,16 @@ impl Raft {
         self.persist();
         self.heartbeat_task = None;
     }
+
+    fn has_matching_log_entry(&self, prev_log_index: usize, prev_log_term: u64) -> bool {
+        if prev_log_index == 0 {
+            return true;
+        }
+        if prev_log_index > self.log.len() {
+            return false;
+        }
+        return self.log[prev_log_index - 1].term == prev_log_term;
+    }
 }
 
 impl Raft {
@@ -269,9 +279,11 @@ impl Node {
     fn start_election_timer(&self, raft: &mut MutexGuard<Raft>) {
         let self_ = self.clone();
         let me = self_.me;
+        let initial_term = raft.state.term;
         raft.election_timer = Some(CancellableTask::spawn(&self.pool, async move {
             let mut timeout =
                 rand::thread_rng().gen_range(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
+            debug!("node {}: election timer start for term {} ({})", me, initial_term, timeout);
             Delay::new(Duration::from_millis(timeout)).await;
             loop {
                 debug!("node {}: election timeout ({})", me, timeout);
@@ -286,8 +298,8 @@ impl Node {
                 let peers = raft.peers.clone();
                 let votes_needed = peers.len() / 2;
                 debug!(
-                    "node {}: starting election, waiting for {} votes",
-                    me, votes_needed
+                    "node {}: starting election (term {}), waiting for {} votes",
+                    me, term, votes_needed
                 );
                 let last_log_index = raft.log.len() as u64;
                 let last_log_term = if last_log_index > 0 {
@@ -321,6 +333,7 @@ impl Node {
                     }
                 }
                 timeout = rand::thread_rng().gen_range(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
+                debug!("node {}: election timer start for term {} ({})", me, term, timeout);
                 select! {
                     _ = Delay::new(Duration::from_millis(timeout)).fuse() => {
                         // continue loop
@@ -622,6 +635,14 @@ impl RaftService for Node {
             raft.vote = None;
             raft.become_follower(args.term);
         }
+        self.start_election_timer(&mut raft);
+
+        if !raft.has_matching_log_entry(args.prev_log_index as usize, args.prev_log_term) {
+            return Ok(AppendEntriesReply {
+                term: args.term,
+                success: false,
+            });
+        }
 
         raft.log.truncate(args.prev_log_index as usize);
         raft.log.extend_from_slice(&args.entries);
@@ -631,7 +652,6 @@ impl RaftService for Node {
         raft.persist();
 
         self.advance_state_machine(&mut raft);
-        self.start_election_timer(&mut raft);
 
         Ok(AppendEntriesReply {
             term: args.term,
