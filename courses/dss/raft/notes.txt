@@ -1,1 +1,6 @@
 Idea: make the term variable _reactive_ - term change must invalidate any actions associated with the previous term
+
+My questions about Raft:
+
+The paper says that a follower should increment its current term on election timeout. However, if such a follower is partitioned from the rest of the system for a long time, several election timeouts may happen. This will cause it to have higher term number than the rest of the system.
+When it comes back online, it will knock out the current leader (because it has higher term number), causing an unnecessary reelection in an otherwise well-functioning cluster.
