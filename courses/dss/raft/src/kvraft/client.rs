@@ -21,9 +21,7 @@ impl fmt::Debug for Clerk {
 
 impl Clerk {
     pub fn new(name: String, servers: Vec<KvClient>) -> Clerk {
-        // You'll have to add code here.
-        // Clerk { name, servers }
-        crate::your_code_here((name, servers))
+        Clerk { name, servers }
     }
 
     /// fetch the current value for a key.
