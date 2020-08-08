@@ -842,9 +842,7 @@ fn test_figure_8_unreliable_2c() {
             if cfg.rafts.lock().unwrap()[i]
                 .as_ref()
                 .unwrap()
-                .start(&Entry {
-                    x: random.gen::<u64>() % 10000,
-                })
+                .start(&Entry { x: iters })
                 .is_ok()
                 && cfg.connected[i]
             {
@@ -882,13 +880,7 @@ fn test_figure_8_unreliable_2c() {
         }
     }
 
-    cfg.one(
-        Entry {
-            x: random.gen::<u64>() % 10000,
-        },
-        servers,
-        true,
-    );
+    cfg.one(Entry { x: 6666 }, servers, true);
 
     cfg.end();
 }

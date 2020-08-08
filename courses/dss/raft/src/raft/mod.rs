@@ -541,6 +541,7 @@ impl Node {
                 if raft.state.term > term {
                     return;
                 }
+                let old_next_index = raft.next_index[peer_index];
                 if success {
                     raft.match_index[peer_index] = match_index;
                     raft.next_index[peer_index] = raft.match_index[peer_index] + 1;
@@ -549,11 +550,16 @@ impl Node {
                         me, peer_index, raft.match_index[peer_index], raft.next_index[peer_index]
                     );
                     self_.advance_commit_index_leader(raft);
-                } else if raft.next_index[peer_index] > 0 {
-                    raft.next_index[peer_index] = raft.next_index[peer_index] - 1;
+                } else if old_next_index > 0 {
+                    raft.next_index[peer_index] =
+                        (raft.match_index[peer_index] + old_next_index) / 2;
                     debug!(
-                        "node {}: peer {} has stale log: match_index = {}, next_index = {}",
-                        me, peer_index, raft.match_index[peer_index], raft.next_index[peer_index]
+                        "node {}: peer {} has stale log: match_index = {}, next_index: {} -> {}",
+                        me,
+                        peer_index,
+                        raft.match_index[peer_index],
+                        old_next_index,
+                        raft.next_index[peer_index]
                     );
                     self_.send_log_entries_to(&raft, peer_index, peer_clone);
                 }
