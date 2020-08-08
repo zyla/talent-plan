@@ -434,20 +434,21 @@ impl Node {
     where
         M: labcodec::Message + std::fmt::Debug,
     {
+        let mut buf = vec![];
+        labcodec::encode(command, &mut buf).expect("message should encode without trouble");
+        async_std::task::block_on(self.do_start(buf))
+    }
+
+    pub async fn do_start(&self, command: Vec<u8>) -> Result<(u64, u64)>
+    {
         let self_ = self.clone();
-        let mut raft = async_std::task::block_on(self_.raft.lock());
+        let mut raft = self.raft.lock().await;
         if !raft.state.is_leader {
             return Err(Error::NotLeader);
         }
         let term = raft.state.term;
-        let mut buf = vec![];
-        labcodec::encode(command, &mut buf).expect("message should encode without trouble");
         let index = raft.log.len() as u64 + 1;
-        raft.log.push(Entry { term, command: buf });
-        debug!(
-            "node {} added log entry {:?} at index {}",
-            raft.me, command, index
-        );
+        raft.log.push(Entry { term, command });
 
         let self_1 = self_.clone();
         self_.pool.spawn_ok(async move {
