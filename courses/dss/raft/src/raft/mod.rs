@@ -675,8 +675,19 @@ impl RaftService for Node {
             });
         }
 
-        raft.log.truncate(args.prev_log_index as usize);
-        raft.log.extend_from_slice(&args.entries);
+        for (i, entry) in args.entries.into_iter().enumerate() {
+            let index = args.prev_log_index as usize + i;
+            if index < raft.log.len() && raft.log[index].term != entry.term {
+                debug!(
+                    "node {} deleted stale log entries {}-{}",
+                    self.me, index + 1, raft.log.len()
+                );
+                raft.log.truncate(index);
+            }
+            if index >= raft.log.len() {
+                raft.log.push(entry);
+            }
+        }
 
         raft.commit_index = min(raft.log.len(), args.leader_commit as usize);
 
