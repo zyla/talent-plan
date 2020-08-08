@@ -321,19 +321,42 @@ impl Node {
                         let peer_clone = peer.clone();
                         let wg = wg.clone();
                         peer.spawn(async move {
-                            if let Ok(RequestVoteReply {
-                                vote_granted: true, ..
-                            }) = peer_clone
-                                .request_vote(&RequestVoteArgs {
-                                    candidate_id: me as u64,
-                                    term,
-                                    last_log_index,
-                                    last_log_term,
-                                })
-                                .await
-                            {
-                                // FIXME: check term number
-                                wg.done();
+                            loop {
+                                select! {
+                                    reply = peer_clone.request_vote(&RequestVoteArgs {
+                                        candidate_id: me as u64,
+                                        term,
+                                        last_log_index,
+                                        last_log_term,
+                                    }).fuse() => {
+                                        match reply {
+                                            Ok(RequestVoteReply {
+                                                vote_granted: true,
+                                                term: reply_term
+                                            }) if reply_term == term => {
+                                                wg.done();
+                                                break;
+                                            }
+                                            Err(labrpc::Error::Timeout) => {
+                                                debug!(
+                                                    "node {}: timeout sending RequestVote (term {}) to {}",
+                                                    me, term, index
+                                                );
+                                                continue;
+                                            }
+                                            _ => {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    _ = Delay::new(Duration::from_millis(100)).fuse() => {
+                                        debug!(
+                                            "node {}: timeout sending RequestVote (term {}) to {}",
+                                            me, term, index
+                                        );
+                                        continue;
+                                    }
+                                }
                             }
                         });
                     }
