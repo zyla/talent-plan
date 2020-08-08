@@ -356,10 +356,17 @@ impl Config {
 
 impl Drop for Config {
     fn drop(&mut self) {
-        let servers = self.servers.lock().unwrap();
-        for s in &servers.kvservers {
-            if let Some(s) = s {
-                s.kill();
+        match self.servers.lock() {
+            Ok(servers) => {
+                for s in &servers.kvservers {
+                    if let Some(s) = s {
+                        s.kill();
+                    }
+                }
+            }
+            Err(err) => {
+                // Avoid double panic
+                error!("Config::drop: servers lock poisoned: {:?}", err);
             }
         }
     }
