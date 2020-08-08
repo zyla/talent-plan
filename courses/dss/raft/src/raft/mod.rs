@@ -69,6 +69,8 @@ pub struct Raft {
     last_applied: usize,
     next_index: Vec<usize>,
     match_index: Vec<usize>,
+
+    append_entries_epoch: usize,
 }
 
 #[derive(::prost::Message)]
@@ -152,6 +154,7 @@ impl Raft {
             last_applied: 0,
             next_index,
             match_index,
+            append_entries_epoch: 0,
         };
 
         // initialize from state persisted before a crash
@@ -424,7 +427,7 @@ impl Node {
 
     async fn send_log_entries(&self) {
         let me = self.me;
-        let raft = self.raft.lock().await;
+        let mut raft = self.raft.lock().await;
         let term = raft.state.term;
         if !raft.state.is_leader {
             warn!(
@@ -435,83 +438,91 @@ impl Node {
         }
         debug!("node {}: sending log entries (term {})", me, term);
 
+        raft.append_entries_epoch += 1;
+
         for (peer_index, peer) in raft.peers.iter().enumerate() {
             if peer_index == me {
                 continue;
             }
-            let peer_clone = peer.clone();
-            let self_ = self.clone();
-            let send_index = min(
-                raft.log.len() + 1,
-                max(
-                    raft.next_index[peer_index],
-                    raft.match_index[peer_index] + 1,
-                ),
-            );
-            let msg = AppendEntriesArgs {
-                term,
-                prev_log_index: send_index.saturating_sub(1) as u64,
-                prev_log_term: if send_index <= 1 {
-                    0
-                } else {
-                    raft.log[send_index - 2].term as u64
-                },
-                entries: if send_index == 0 {
-                    vec![]
-                } else {
-                    raft.log[send_index - 1..].to_vec()
-                },
-                leader_commit: raft.commit_index as u64,
-            };
-            let match_index = min(raft.log.len(), send_index + msg.entries.len());
-            debug!(
-                "node {}: send_index[{}] = {}, match_index = {}",
-                me, peer_index, send_index, match_index
-            );
-            peer.spawn(async move {
-                loop {
-                    if let Ok(AppendEntriesReply { term: reply_term, success }) = peer_clone.append_entries(&msg).await {
-                        if reply_term < term {
-                            warn!("node {} got stale AppendEntriesEntry", me);
-                            return;
-                        }
-                        if reply_term > term {
-                            warn!(
-                                "node {} got AppendEntriesEntry with newer term; becoming follower",
-                                me
-                            );
-                            let mut raft = self_.raft.lock().await;
-                            raft.become_follower(reply_term);
-                            self_.start_election_timer(&mut raft);
-                            return;
-                        }
-                        let mut raft = self_.raft.lock().await;
-                        if raft.state.term > term {
-                            return;
-                        }
-                        if raft.match_index[peer_index] >= match_index {
-                            return;
-                        }
-                        if success {
-                            raft.match_index[peer_index] = match_index;
-                            raft.next_index[peer_index] = raft.match_index[peer_index] + 1;
-                            debug!(
-                                "node {}: updated peer state [{}]: match_index = {}, next_index = {}",
-                                me, peer_index, raft.match_index[peer_index], raft.next_index[peer_index]
-                            );
-                            self_.advance_commit_index_leader(raft);
-                            break;
-                        } else {
-                            raft.next_index[peer_index] = raft.next_index[peer_index] - 1;
-                            debug!(
-                                "node {}: peer {} has stale log: match_index = {}, next_index = {}",
-                                me, peer_index, raft.match_index[peer_index], raft.next_index[peer_index]
-                            );
-                        }
-                    }
-                }
-            });
+            self.send_log_entries_to(&raft, peer_index, peer.clone());
         }
+    }
+
+    fn send_log_entries_to(&self, raft: &Raft, peer_index: usize, peer: RaftClient) {
+        let me = self.me;
+        let term = raft.state.term;
+        let self_ = self.clone();
+        let peer_clone = peer.clone();
+        let send_index = min(
+            raft.log.len() + 1,
+            max(
+                raft.next_index[peer_index],
+                raft.match_index[peer_index] + 1,
+            ),
+        );
+        let msg = AppendEntriesArgs {
+            term,
+            prev_log_index: send_index.saturating_sub(1) as u64,
+            prev_log_term: if send_index <= 1 {
+                0
+            } else {
+                raft.log[send_index - 2].term as u64
+            },
+            entries: if send_index == 0 {
+                vec![]
+            } else {
+                raft.log[send_index - 1..].to_vec()
+            },
+            leader_commit: raft.commit_index as u64,
+        };
+        let match_index = min(raft.log.len(), send_index + msg.entries.len());
+        debug!(
+            "node {}: send_index[{}] = {}, match_index = {}",
+            me, peer_index, send_index, match_index
+        );
+        let start_epoch = raft.append_entries_epoch;
+        peer.spawn(async move {
+            if let Ok(AppendEntriesReply { term: reply_term, success }) = peer_clone.append_entries(&msg).await {
+                if reply_term < term {
+                    warn!("node {} got stale AppendEntriesEntry", me);
+                    return;
+                }
+                if reply_term > term {
+                    warn!(
+                        "node {} got AppendEntriesEntry with newer term; becoming follower",
+                        me
+                    );
+                    let mut raft = self_.raft.lock().await;
+                    raft.become_follower(reply_term);
+                    self_.start_election_timer(&mut raft);
+                    return;
+                }
+                let mut raft = self_.raft.lock().await;
+                if raft.append_entries_epoch > start_epoch {
+                    warn!("node {}: append entries task got cancelled", me);
+                    return;
+                }
+                if raft.state.term > term {
+                    return;
+                }
+                if success {
+                    raft.match_index[peer_index] = match_index;
+                    raft.next_index[peer_index] = raft.match_index[peer_index] + 1;
+                    debug!(
+                        "node {}: updated peer state [{}]: match_index = {}, next_index = {}",
+                        me, peer_index, raft.match_index[peer_index], raft.next_index[peer_index]
+                    );
+                    self_.advance_commit_index_leader(raft);
+                } else if raft.next_index[peer_index] > 0 {
+                    raft.next_index[peer_index] = raft.next_index[peer_index] - 1;
+                    debug!(
+                        "node {}: peer {} has stale log: match_index = {}, next_index = {}",
+                        me, peer_index, raft.match_index[peer_index], raft.next_index[peer_index]
+                    );
+                    self_.send_log_entries_to(&raft, peer_index, peer_clone);
+                }
+            }
+        });
     }
 
     fn advance_commit_index_leader(&self, mut raft: MutexGuard<Raft>) {
@@ -647,7 +658,7 @@ impl RaftService for Node {
         let current_term = raft.state.term;
         if args.term < current_term {
             return Ok(AppendEntriesReply {
-                term: raft.state.term,
+                term: current_term,
                 success: false,
             });
         }
