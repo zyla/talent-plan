@@ -318,10 +318,19 @@ impl Node {
                 let wg = Arc::new(WaitGroup::new(votes_needed));
                 for (index, peer) in peers.iter().enumerate() {
                     if index != me {
+                        let self_clone = self_.clone();
                         let peer_clone = peer.clone();
                         let wg = wg.clone();
                         peer.spawn(async move {
                             loop {
+                                let current_term = self_clone.raft.lock().await.state.term;
+                                if current_term != term {
+                                    debug!(
+                                        "node {}: election task cancelled (term {} -> {})",
+                                        me, term, current_term
+                                    );
+                                    break;
+                                }
                                 select! {
                                     reply = peer_clone.request_vote(&RequestVoteArgs {
                                         candidate_id: me as u64,
