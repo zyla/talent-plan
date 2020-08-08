@@ -10,7 +10,7 @@ use futures::future::FutureExt;
 use futures::select;
 use futures::stream::StreamExt;
 use futures_timer::Delay;
-use log::{debug, error};
+use log::{debug};
 use rand::{thread_rng, Rng};
 
 use crate::client::{Client, Rpc};
@@ -89,8 +89,8 @@ impl Network {
                 let net = network.clone();
                 network.core.poller.spawn_ok(async move {
                     let res = net.process_rpc(rpc).await;
-                    if let Err(e) = resp.send(res) {
-                        error!("fail to send resp: {:?}", e);
+                    if let Err(_e) = resp.send(res) {
+//                        error!("fail to send resp: {:?}", e);
                     }
                 })
             }
