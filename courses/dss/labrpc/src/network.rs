@@ -10,7 +10,7 @@ use futures::future::FutureExt;
 use futures::select;
 use futures::stream::StreamExt;
 use futures_timer::Delay;
-use log::{debug};
+use log::debug;
 use rand::{thread_rng, Rng};
 
 use crate::client::{Client, Rpc};
@@ -90,7 +90,7 @@ impl Network {
                 network.core.poller.spawn_ok(async move {
                     let res = net.process_rpc(rpc).await;
                     if let Err(_e) = resp.send(res) {
-//                        error!("fail to send resp: {:?}", e);
+                        //                        error!("fail to send resp: {:?}", e);
                     }
                 })
             }
@@ -206,7 +206,11 @@ impl Network {
                 };
 
                 if !reliable && (thread_rng().gen::<u64>() % 1000) < 100 {
-                    debug!("{} to server {} dropped with Error::Timeout", rpc.fq_name, server.name());
+                    debug!(
+                        "{} to server {} dropped with Error::Timeout",
+                        rpc.fq_name,
+                        server.name()
+                    );
                     // drop the request, return as if timeout
                     Delay::new(Duration::from_millis(short_delay.unwrap())).await;
                     return Err(Error::Timeout);
@@ -279,11 +283,25 @@ async fn process_rpc(
 ) -> Result<Vec<u8>> {
     // Dispatch ===============================================================
     if let Some(delay) = delay {
-        debug!("{} to server {} will be delayed ({}ms)", rpc.fq_name, server.name(), delay);
+        debug!(
+            "{} to server {} will be delayed ({}ms)",
+            rpc.fq_name,
+            server.name(),
+            delay
+        );
         Delay::new(Duration::from_millis(delay)).await;
-        debug!("{} to server {} was delayed ({}ms)", rpc.fq_name, server.name(), delay);
+        debug!(
+            "{} to server {} was delayed ({}ms)",
+            rpc.fq_name,
+            server.name(),
+            delay
+        );
     } else {
-        debug!("{} to server {} will be delivered promptly", rpc.fq_name, server.name());
+        debug!(
+            "{} to server {} will be delivered promptly",
+            rpc.fq_name,
+            server.name()
+        );
     }
     // We has finished the delay, take it out to prevent polling
     // twice.
