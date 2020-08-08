@@ -225,7 +225,7 @@ impl Raft {
         if prev_log_index > self.log.len() {
             return false;
         }
-        return self.log[prev_log_index - 1].term == prev_log_term;
+        self.log[prev_log_index - 1].term == prev_log_term
     }
 }
 
