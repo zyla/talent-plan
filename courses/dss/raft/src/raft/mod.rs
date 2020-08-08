@@ -482,7 +482,11 @@ impl Node {
         );
         let start_epoch = raft.append_entries_epoch;
         peer.spawn(async move {
-            if let Ok(AppendEntriesReply { term: reply_term, success }) = peer_clone.append_entries(&msg).await {
+            if let Ok(AppendEntriesReply {
+                term: reply_term,
+                success,
+            }) = peer_clone.append_entries(&msg).await
+            {
                 if reply_term < term {
                     warn!("node {} got stale AppendEntriesEntry", me);
                     return;
@@ -680,7 +684,9 @@ impl RaftService for Node {
             if index < raft.log.len() && raft.log[index].term != entry.term {
                 debug!(
                     "node {} deleted stale log entries {}-{}",
-                    self.me, index + 1, raft.log.len()
+                    self.me,
+                    index + 1,
+                    raft.log.len()
                 );
                 raft.log.truncate(index);
             }
