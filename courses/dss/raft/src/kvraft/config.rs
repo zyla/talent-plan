@@ -27,7 +27,11 @@ struct Servers {
 fn init_logger() {
     use std::sync::Once;
     static LOGGER_INIT: Once = Once::new();
-    LOGGER_INIT.call_once(env_logger::init);
+    LOGGER_INIT.call_once(|| {
+        env_logger::Builder::from_default_env()
+            .format_timestamp_millis()
+            .init();
+    });
 }
 
 pub struct Config {

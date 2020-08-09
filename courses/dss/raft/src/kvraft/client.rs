@@ -1,4 +1,6 @@
 use std::fmt;
+use std::cell::Cell;
+use futures::executor::block_on;
 
 use crate::proto::kvraftpb::*;
 
@@ -10,7 +12,7 @@ enum Op {
 pub struct Clerk {
     pub name: String,
     pub servers: Vec<KvClient>,
-    // You will have to modify this struct.
+    leader: Cell<usize>,
 }
 
 impl fmt::Debug for Clerk {
@@ -21,7 +23,7 @@ impl fmt::Debug for Clerk {
 
 impl Clerk {
     pub fn new(name: String, servers: Vec<KvClient>) -> Clerk {
-        Clerk { name, servers }
+        Clerk { name, servers, leader: Cell::new(0), }
     }
 
     /// fetch the current value for a key.
@@ -31,8 +33,20 @@ impl Clerk {
     // you can send an RPC with code like this:
     // if let Some(reply) = self.servers[i].get(args).wait() { /* do something */ }
     pub fn get(&self, key: String) -> String {
-        // You will have to modify this function.
-        crate::your_code_here(key)
+        block_on(async move {
+            let request = GetRequest { key };
+
+            loop {
+                match self.servers[self.leader.get()].get(&request).await {
+                    Ok(GetReply { wrong_leader: false, value, .. }) => {
+                        return value;
+                    }
+                    _ => {
+                        self.next_leader();
+                    }
+                }
+            }
+        })
     }
 
     /// shared by Put and Append.
@@ -40,8 +54,35 @@ impl Clerk {
     // you can send an RPC with code like this:
     // let reply = self.servers[i].put_append(args).unwrap();
     fn put_append(&self, op: Op) {
-        // You will have to modify this function.
-        crate::your_code_here(op)
+        block_on(async move {
+            let request = match op {
+                Op::Put(key, value) => {
+                    PutAppendRequest { key, value, op: 1 }
+                }
+                Op::Append(key, value) => {
+                    PutAppendRequest { key, value, op: 2 }
+                }
+            };
+
+            loop {
+                let server = self.leader.get();
+                debug!("Trying {:?} on {}", request, server);
+                match self.servers[server].put_append(&request).await {
+                    Ok(PutAppendReply { wrong_leader: false, .. }) => {
+                        debug!("{:?} success on {}", request, server);
+                        return;
+                    }
+                    result => {
+                        debug!("{:?} failed on {}: {:?}; trying next server", request, server, result);
+                        self.next_leader();
+                    }
+                }
+            }
+        })
+    }
+
+    fn next_leader(&self) {
+        self.leader.set((self.leader.get() + 1) % self.servers.len());
     }
 
     pub fn put(&self, key: String, value: String) {

@@ -17,8 +17,3 @@ extern crate futures;
 pub mod kvraft;
 mod proto;
 pub mod raft;
-
-/// A place holder for suppressing unused_variables warning.
-fn your_code_here<T>(_: T) -> ! {
-    unimplemented!()
-}

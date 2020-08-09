@@ -50,6 +50,45 @@ fn check(cfg: &Config, ck: &Clerk, key: &str, value: &str) {
     }
 }
 
+#[test]
+fn test_basic_get_3a() {
+    let nservers = 3;
+    let cfg = {
+        let cfg = Config::new(nservers, true, None);
+        cfg.begin("Test: One client, get to a nonexistent key (3A)");
+        Arc::new(cfg)
+    };
+
+    let all = cfg.all();
+    let ck = cfg.make_client(&all);
+
+    let value = get(&cfg, &ck, "k");
+    assert_eq!(value, "");
+
+    cfg.check_timeout();
+    cfg.end();
+}
+
+#[test]
+fn test_basic_put_get_3a() {
+    let nservers = 3;
+    let cfg = {
+        let cfg = Config::new(nservers, true, None);
+        cfg.begin("Test: One client, put + get (3A)");
+        Arc::new(cfg)
+    };
+
+    let all = cfg.all();
+    let ck = cfg.make_client(&all);
+
+    put(&cfg, &ck, "k", "v");
+    let value = get(&cfg, &ck, "k");
+    assert_eq!(value, "v");
+
+    cfg.check_timeout();
+    cfg.end();
+}
+
 // spawn ncli clients and wait until they are all done
 fn spawn_clients_and_wait<Func, Fact>(
     cfg: Arc<Config>,

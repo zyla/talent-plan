@@ -13,7 +13,9 @@ fn main() {
             }
         }
     }
-    prost_build::compile_protos(&protos, includes).unwrap();
+    prost_build::Config::new()
+        .type_attribute("kvraftpb.Op", "#[derive(Serialize, Deserialize)]")
+        .compile_protos(&protos, includes).unwrap();
     for p in protos {
         println!("cargo:rerun-if-changed={}", p.display());
     }

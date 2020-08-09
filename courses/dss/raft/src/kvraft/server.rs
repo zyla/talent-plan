@@ -1,13 +1,9 @@
 use std::sync::Arc;
-
 use futures::StreamExt;
 use futures::channel::mpsc::unbounded;
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::channel::oneshot;
-use futures::future;
-
 use futures::lock::Mutex;
-
 use std::collections::HashMap;
 
 use crate::proto::kvraftpb::*;
@@ -62,9 +58,11 @@ enum Command {
     PutAppend {
         key: String,
         value: String,
+        op: Op,
     },
 }
 
+#[derive(Debug)]
 enum Reply {
     GetReply { value: String },
     PutAppendReply,
@@ -88,39 +86,65 @@ enum Reply {
 pub struct Node {
     server: Arc<KvServer>,
     receivers: Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>,
+    store: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Node {
     pub fn new(kv: KvServer) -> Node {
         let node = Node {
             server: Arc::new(kv),
-            receivers: Arc::new(Mutex::new(HashMap::<u64, oneshot::Sender<Reply>>::new())),
+            receivers: Arc::new(Mutex::new(Default::default())),
+            store: Arc::new(Mutex::new(Default::default())),
         };
 
         let node_clone = node.clone();
         let node_clone_2 = node.clone();
 
         async_std::task::spawn(node_clone_2.server.apply_ch.lock().unwrap().take().unwrap().for_each(move |cmd: raft::ApplyMsg| {
-            if !cmd.command_valid {
-                // ignore other types of ApplyMsg
-                return future::ready(());
-            }
-            match serde_cbor::from_slice(&cmd.command) {
-                Ok(command) => {
-                    node.apply(cmd.command_index, command);
+            let node2 = node.clone();
+            async move {
+                if !cmd.command_valid {
+                    // ignore other types of ApplyMsg
+                    return;
                 }
-                Err(e) => {
-                    panic!("committed command is not an entry {:?}", e);
+                match serde_cbor::from_slice(&cmd.command) {
+                    Ok(command) => {
+                        node2.apply(cmd.command_index, command).await;
+                    }
+                    Err(e) => {
+                        panic!("committed command is not an entry {:?}", e);
+                    }
                 }
             }
-            future::ready(())
         }));
 
         node_clone
     }
 
-    fn apply(&self, command_index: u64, command: Command) {
-        debug!("apply {} {:?}", command_index, command);
+    async fn apply(&self, command_index: u64, command: Command) {
+        debug!("node {}: apply {} {:?}", self.server.me, command_index, command);
+        let reply = match command {
+            Command::Get { key } => {
+                let value = self.store.lock().await.get(&key).map(|s| s.clone()).unwrap_or_else(|| "".into());
+                Reply::GetReply { value }
+            },
+            Command::PutAppend { key, value, op: Op::Put } => {
+                self.store.lock().await.insert(key, value);
+                Reply::PutAppendReply
+            },
+            Command::PutAppend { key, value, op: Op::Append } => {
+                self.store.lock().await.entry(key).or_insert_with(|| "".into()).push_str(&value);
+                Reply::PutAppendReply
+            },
+            Command::PutAppend { op: Op::Unknown, .. } => {
+                panic!("Unknown op");
+            },
+        };
+        debug!("node {}: {} result: {:?}", self.server.me, command_index, reply);
+        let mut receivers = self.receivers.lock().await;
+        if let Some(tx) = receivers.remove(&command_index) {
+            tx.send(reply).unwrap();
+        }
     }
 
     /// the tester calls kill() when a KVServer instance won't
@@ -155,7 +179,7 @@ impl Node {
 impl KvService for Node {
     async fn get(&self, arg: GetRequest) -> labrpc::Result<GetReply> {
         let encoded_command = serde_cbor::to_vec(&Command::Get { key: arg.key }).expect("command should encode without problems");
-        let receivers = self.receivers.lock().await;
+        let mut receivers = self.receivers.lock().await;
         match self.server.rf.do_start(encoded_command).await {
             Ok((index, _)) => {
                 let (tx, rx) = oneshot::channel();
@@ -190,35 +214,36 @@ impl KvService for Node {
         }
     }
 
-    async fn put_append(&self, arg: PutAppendRequest) -> labrpc::Result<PutAppendReply> {
-        let encoded_command = serde_cbor::to_vec(&Command::PutAppend { key: arg.key, value: arg.value, op: arg.op }).expect("command should encode without problems");
-        let receivers = self.receivers.lock().await;
+    async fn put_append(&self, mut arg: PutAppendRequest) -> labrpc::Result<PutAppendReply> {
+        let encoded_command = serde_cbor::to_vec(&Command::PutAppend {
+            key: std::mem::replace(&mut arg.key, "".into()),
+            value: std::mem::replace(&mut arg.value, "".into()),
+            op: arg.op()
+        }).expect("command should encode without problems");
+        let mut receivers = self.receivers.lock().await;
         match self.server.rf.do_start(encoded_command).await {
             Ok((index, _)) => {
                 let (tx, rx) = oneshot::channel();
                 receivers.insert(index, tx);
                 match rx.await {
-                    Ok(Reply::GetReply { value }) => {
-                        Ok(GetReply {
+                    Ok(Reply::PutAppendReply) => {
+                        Ok(PutAppendReply {
                             wrong_leader: false,
                             err: "".into(),
-                            value,
                         })
                     },
                     _ => {
-                        Ok(GetReply {
+                        Ok(PutAppendReply {
                             wrong_leader: true,
                             err: "Not leader".into(),
-                            value: "".into(),
                         })
                     },
                 }
             }
             Err(raft::errors::Error::NotLeader) => {
-                Ok(GetReply {
+                Ok(PutAppendReply {
                     wrong_leader: true,
                     err: "Not leader".into(),
-                    value: "".into(),
                 })
             }
             Err(err) => {
