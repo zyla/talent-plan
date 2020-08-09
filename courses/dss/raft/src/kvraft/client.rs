@@ -37,11 +37,15 @@ impl Clerk {
             let request = GetRequest { key };
 
             loop {
-                match self.servers[self.leader.get()].get(&request).await {
+                let server = self.leader.get();
+                debug!("Trying {:?} on {}", request, server);
+                match self.servers[server].get(&request).await {
                     Ok(GetReply { wrong_leader: false, value, .. }) => {
+                        debug!("{:?} success on {}", request, server);
                         return value;
                     }
-                    _ => {
+                    result => {
+                        debug!("{:?} failed on {}: {:?}; trying next server", request, server, result);
                         self.next_leader();
                     }
                 }

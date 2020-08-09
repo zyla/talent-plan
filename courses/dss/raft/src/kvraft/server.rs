@@ -140,9 +140,10 @@ impl Node {
                 panic!("Unknown op");
             },
         };
-        debug!("node {}: {} result: {:?}", self.server.me, command_index, reply);
         let mut receivers = self.receivers.lock().await;
-        if let Some(tx) = receivers.remove(&command_index) {
+        let listener = receivers.remove(&command_index);
+        debug!("node {}: apply {} result: {:?} (has_listener={:?})", self.server.me, command_index, reply, listener.is_some());
+        if let Some(tx) = listener {
             tx.send(reply).unwrap();
         }
     }
@@ -184,6 +185,7 @@ impl KvService for Node {
             Ok((index, _)) => {
                 let (tx, rx) = oneshot::channel();
                 receivers.insert(index, tx);
+                drop(receivers);
                 match rx.await {
                     Ok(Reply::GetReply { value }) => {
                         Ok(GetReply {
@@ -225,6 +227,7 @@ impl KvService for Node {
             Ok((index, _)) => {
                 let (tx, rx) = oneshot::channel();
                 receivers.insert(index, tx);
+                drop(receivers);
                 match rx.await {
                     Ok(Reply::PutAppendReply) => {
                         Ok(PutAppendReply {
